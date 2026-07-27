@@ -40,6 +40,7 @@ fn test_report(origin: &str, source: &str, sequence: u64, mode: WorkerMode) -> L
             gen_throughput: 5.0,
             cache_hit_rate: 0.5,
             utilization: 0.7,
+            prefill_throughput: 6.0,
         }],
     }
 }
@@ -68,7 +69,7 @@ fn disabled_snapshot_has_exact_empty_shape() {
     );
 }
 
-/// Rank aggregation sums counters and generation throughput.
+/// Rank aggregation sums counters and both throughput fields.
 #[test]
 fn aggregate_sums_rank_loads() {
     let first = validate_rank(&test_report("w:30000", "s", 1, WorkerMode::Plain).ranks[0]).unwrap();
@@ -79,6 +80,15 @@ fn aggregate_sums_rank_loads() {
     assert_eq!(aggregate.free_tokens, 160);
     assert_eq!(aggregate.available_slots, 16);
     assert_eq!(aggregate.gen_throughput, 10.0);
+    assert_eq!(aggregate.prefill_throughput, 12.0);
+}
+
+/// Invalid prefill throughput is rejected before the store changes.
+#[test]
+fn rejects_non_finite_prefill_throughput() {
+    let mut rank = test_report("w:30000", "s", 1, WorkerMode::Plain).ranks[0];
+    rank.prefill_throughput = f64::NAN;
+    assert!(validate_rank(&rank).is_err());
 }
 
 /// Invalid counts, capacity relations, duplicate ranks, and floats are

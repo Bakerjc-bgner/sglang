@@ -172,6 +172,7 @@ async def _report_stream():
                                     gen_throughput=1.0,
                                     cache_hit_rate=0.0,
                                     utilization=0.0,
+                                    prefill_throughput=1.0,
                                 )
                             ],
                         )
