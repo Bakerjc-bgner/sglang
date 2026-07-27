@@ -88,6 +88,7 @@ pub struct RankSnapshot {
     pub gen_throughput: f64,
     pub cache_hit_rate: f64,
     pub utilization: f64,
+    pub prefill_throughput: f64,
 }
 
 /// Aggregated worker load used by policies and exposed for diagnostics.
@@ -109,6 +110,7 @@ pub struct AggregateLoad {
     pub weighted_token_usage: f64,
     pub max_rank_token_usage: f64,
     pub gen_throughput: f64,
+    pub prefill_throughput: f64,
 }
 
 /// Owned worker entry returned by one immutable snapshot capture.
@@ -1070,7 +1072,10 @@ fn validate_rank(rank: &RankLoad) -> IngestResult<RankSnapshot> {
             ))));
         }
     }
-    for (name, value) in [("gen_throughput", rank.gen_throughput)] {
+    for (name, value) in [
+        ("gen_throughput", rank.gen_throughput),
+        ("prefill_throughput", rank.prefill_throughput),
+    ] {
         if !value.is_finite() || value < 0.0 {
             return Err(ingest_status(Status::invalid_argument(format!(
                 "{name} must be finite and non-negative"
@@ -1091,6 +1096,7 @@ fn validate_rank(rank: &RankLoad) -> IngestResult<RankSnapshot> {
         gen_throughput: rank.gen_throughput,
         cache_hit_rate: rank.cache_hit_rate,
         utilization: rank.utilization,
+        prefill_throughput: rank.prefill_throughput,
     })
 }
 
@@ -1110,6 +1116,7 @@ fn aggregate_ranks(ranks: &[RankSnapshot]) -> AggregateLoad {
         aggregate.max_total_num_tokens += rank.max_total_num_tokens;
         aggregate.max_running_requests += rank.max_running_requests;
         aggregate.gen_throughput += rank.gen_throughput;
+        aggregate.prefill_throughput += rank.prefill_throughput;
         weighted_token_usage += rank.token_usage * rank.max_total_num_tokens as f64;
         aggregate.max_rank_token_usage = aggregate.max_rank_token_usage.max(rank.token_usage);
     }
