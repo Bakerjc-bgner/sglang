@@ -68,7 +68,7 @@ FastAPI lifespan
 | `monitor.py` | `MonitorManager` owns the target map and performs identity-safe upserts; each `MonitorTask` owns one gRPC stream and its fixed-rate lease/reconnect state machine. |
 | `runtime.py` | `LoadReporterRuntime`: top-level composition, the `start_reporting` control plane, the synchronous `notify_request_finished` hook, and bounded shutdown. |
 | `ipc.py` | Correlates multi-tokenizer control requests and responses, coalesces refresh events, and maps stable errors. |
-| `proto/load_monitor.proto` | Embedded `router.loadmonitor.v1` IDL shared with the Router load-monitor service. |
+| `proto/load_monitor.proto` | Embedded `router.loadmonitor.v1` IDL. Fields 1 through 13 match the Router contract; Engine field 14 is an additive load-report extension. |
 
 ### Regenerating the Python protobuf code
 
@@ -182,7 +182,18 @@ the protobuf or gRPC runtime-version checks emitted by the generator.
 ## Protocol constraints
 
 - **Wire contract:** fields 1 through 13 and all enum values in
-  `proto/load_monitor.proto` match the canonical Router IDL.
+  `proto/load_monitor.proto` match the canonical Router IDL. Engine-side
+  `RankLoad.prefill_throughput` is the additive field 14. Routers generated
+  from the older schema safely preserve protocol compatibility by treating it
+  as an unknown field; a Router must regenerate its bindings before it can
+  consume the value.
+- **Prefill throughput:** `prefill_throughput` is the most recent completed
+  Prefill compute-token count divided by the elapsed Prefill statistics
+  interval. Cache-hit tokens are excluded. It is nonzero only while a PD
+  Prefill scheduler is active; an idle PD Prefill Engine, an Aggregated Engine,
+  or a Decode Engine reports `0`. The field is carried internally and exposed
+  only through gRPC LoadReport. It is intentionally absent from `/v1/loads`
+  JSON and Prometheus-text projections.
 - **`Worker.worker_addr`:** normalize the registration HTTP request origin to
   `scheme://host:port`; never read `Forwarded` or `X-Forwarded-*`.
 - **`RankLoad.snapshot_time_unix_ms`:** prefer
@@ -227,5 +238,5 @@ establish only one Router gRPC stream.
   delivery, or persistence.
 - No custom gRPC keepalive or message-size configuration; grpcio defaults are
   used.
-- The Router protocol has no SDK metadata, normalized load, `worker_id`, or
-  similar extensions.
+- Except for the additive `prefill_throughput` field, the Router protocol has
+  no SDK metadata, normalized load, `worker_id`, or similar extensions.

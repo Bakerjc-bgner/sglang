@@ -78,7 +78,8 @@ for follow-up scheduling integrations.
 
 The Snapshot endpoint returns one immutable, versioned capture with worker
 freshness, source and sequence metadata, complete DP-rank values, and aggregate
-load. When monitoring is disabled it returns:
+load. Prefill workers additionally expose completed uncached Prefill throughput
+in each rank and the worker aggregate. When monitoring is disabled it returns:
 
 ```json
 {"enabled":false,"version":0,"captured_at":null,"workers":[]}
