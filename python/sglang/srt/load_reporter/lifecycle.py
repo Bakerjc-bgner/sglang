@@ -331,6 +331,8 @@ def _install_lifecycle_shadow(
     """
     from sglang.srt.load_reporter.decorator import enable_load_monitor
 
+    had_instance_override = method_name in owner.__dict__
+    instance_override = owner.__dict__.get(method_name)
     original = getattr(owner, method_name)
     decorated = enable_load_monitor("request_lifecycle")(original)
     setattr(owner, method_name, decorated)
@@ -338,6 +340,9 @@ def _install_lifecycle_shadow(
     def _restore() -> None:
         # Only undo our own shadow; never clobber a later replacement.
         if owner.__dict__.get(method_name, None) is decorated:
-            del owner.__dict__[method_name]
+            if had_instance_override:
+                owner.__dict__[method_name] = instance_override
+            else:
+                del owner.__dict__[method_name]
 
     handle._restore = _restore

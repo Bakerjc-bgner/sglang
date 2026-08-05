@@ -139,6 +139,26 @@ class TestNoBinding:
         collected = [x async for x in call()]
         assert collected == items
 
+    @pytest.mark.parametrize("port", [None, 30100])
+    def test_async_iterator_is_returned_directly_when_inactive(self, port):
+        from sglang.srt.load_reporter.decorator import enable_load_monitor
+
+        class DirectAsyncIterator:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        owner = FakeOwner(port=port)
+        direct = DirectAsyncIterator()
+
+        @enable_load_monitor("request_lifecycle")
+        def generate(self):
+            return direct
+
+        assert generate(owner) is direct
+
     def test_sync_no_grpc_import_when_no_binding(self, monkeypatch):
         """Ensure grpc/protobuf are not imported via decorator when unbound."""
         import sys
@@ -198,6 +218,33 @@ class TestMultipleOwners:
         unbind = bind_load_monitor(owner, lambda r, c: None)
         unbind()
         unbind()  # must not raise
+
+    def test_stale_unbind_does_not_remove_newer_binding(self):
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
+
+        owner = FakeOwner()
+        old_events = []
+        new_events = []
+
+        @enable_load_monitor("scheduler_message")
+        def dispatch(self, obj):
+            return None
+
+        unbind_old = bind_load_monitor(
+            owner, lambda reason, count: old_events.append((reason, count))
+        )
+        bind_load_monitor(
+            owner, lambda reason, count: new_events.append((reason, count))
+        )
+
+        unbind_old()
+        dispatch(owner, make_single_dispatch())
+
+        assert old_events == []
+        assert len(new_events) == 1
 
     def test_owner_gc_removes_registry_entry(self):
         from sglang.srt.load_reporter.decorator import _REGISTRY, bind_load_monitor

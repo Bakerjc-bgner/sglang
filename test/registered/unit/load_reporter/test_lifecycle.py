@@ -502,3 +502,31 @@ class TestHandleDelegation:
             assert handle.update_expected_dp_ranks(range(2)) is False
         finally:
             await handle.close()
+
+
+class TestLifecycleShadowRestoration:
+    def test_restores_preexisting_instance_override(self):
+        from sglang.srt.load_reporter.lifecycle import (
+            LoadReporterHandle,
+            _install_lifecycle_shadow,
+        )
+
+        class Owner:
+            async def generate_request(self):
+                yield "class"
+
+        async def instance_override():
+            yield "instance"
+
+        owner = Owner()
+        owner.generate_request = instance_override
+        original = owner.__dict__["generate_request"]
+        handle = LoadReporterHandle()
+
+        _install_lifecycle_shadow(handle, owner, "generate_request")
+        assert owner.__dict__["generate_request"] is not original
+
+        assert handle._restore is not None
+        handle._restore()
+
+        assert owner.__dict__["generate_request"] is original

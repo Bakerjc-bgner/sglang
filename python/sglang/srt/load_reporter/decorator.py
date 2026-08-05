@@ -68,7 +68,8 @@ def bind_load_monitor(owner: Any, notify: _NotifyFn) -> Callable[[], None]:
     _REGISTRY[owner] = notify
 
     def unbind() -> None:
-        _REGISTRY.pop(owner, None)
+        if _REGISTRY.get(owner) is notify:
+            _REGISTRY.pop(owner, None)
 
     return unbind
 
@@ -166,31 +167,24 @@ def _make_scheduler_message_decorator(fn: Callable[..., Any]) -> Callable[..., A
     return _scheduler_wrapper
 
 
-async def _finalize_request_lifecycle(owner: Any, make_aiter: Callable[[], Any]):
+async def _finalize_request_lifecycle(source: Any, notify: _NotifyFn):
     """Shared async-generator finalization for both decorator call styles.
 
-    Iterates the source async generator produced by ``make_aiter`` and fires
+    Iterates ``source`` and fires
     exactly one ``COMPLETION`` event in the ``finally`` block — covering normal
-    exhaustion, early ``aclose()``, task cancellation, and unhandled
-    exceptions.  A ``None`` binding (disabled or unbound) is a pure passthrough.
+    exhaustion, early ``aclose()``, task cancellation, and unhandled exceptions.
 
     Args:
-        owner: Instance whose bound callback and ``server_args`` gate the event.
-        make_aiter: Zero-arg callable returning the source async iterator.
+        source: Source async iterator returned by the original method.
+        notify: Callback captured by the synchronous wrapper.
 
     Yields:
         Each item produced by the wrapped async generator, unchanged.
     """
-    notify = _get_notify(owner)
-    if notify is None:
-        # Pure passthrough — no try/finally overhead.
-        async for item in make_aiter():
-            yield item
-        return
     from sglang.srt.managers.io_struct import LoadReporterRefreshReason as Reason
 
     try:
-        async for item in make_aiter():
+        async for item in source:
             yield item
     finally:
         try:
@@ -221,12 +215,20 @@ def _make_request_lifecycle_decorator(fn: Callable[..., Any]) -> Callable[..., A
 
         @functools.wraps(fn)
         def _bound_wrapper(*args: Any, **kwargs: Any):
-            return _finalize_request_lifecycle(owner, lambda: fn(*args, **kwargs))
+            source = fn(*args, **kwargs)
+            notify = _get_notify(owner)
+            if notify is None:
+                return source
+            return _finalize_request_lifecycle(source, notify)
 
         return _bound_wrapper
 
     @functools.wraps(fn)
     def _unbound_wrapper(self: Any, *args: Any, **kwargs: Any):
-        return _finalize_request_lifecycle(self, lambda: fn(self, *args, **kwargs))
+        source = fn(self, *args, **kwargs)
+        notify = _get_notify(self)
+        if notify is None:
+            return source
+        return _finalize_request_lifecycle(source, notify)
 
     return _unbound_wrapper
