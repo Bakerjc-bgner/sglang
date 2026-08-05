@@ -305,15 +305,7 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
-    # Embedded load reporter lifecycle
-    from sglang.srt.load_reporter.lifecycle import LoadReporterLifecycle
-
-    reporter = LoadReporterLifecycle.from_http_server(
-        server_args=server_args,
-        tokenizer_manager=_global_state.tokenizer_manager,
-        app_state=fast_api_app.state,
-    )
-    await reporter.start()
+    # Load reporter lifecycle: Phase 4 (Task 4.1) will insert start_load_reporter here.
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -438,11 +430,6 @@ async def lifespan(fast_api_app: FastAPI):
                 sidecar.stop()
             except Exception:
                 logger.exception("Failed to stop sidecar")
-        # Close load reporter lifecycle (detaches hooks and closes runtime/notifier)
-        try:
-            await reporter.close()
-        except Exception:
-            logger.exception("Load reporter shutdown failed")
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
@@ -478,10 +465,6 @@ app.include_router(v1_loads_router)
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 
 app.include_router(elastic_ep_router)
-
-from sglang.srt.load_reporter.registration import router as load_reporter_router
-
-app.include_router(load_reporter_router)
 
 
 def _anthropic_validation_message(raw_errors) -> str:

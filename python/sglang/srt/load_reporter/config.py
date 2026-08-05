@@ -55,6 +55,7 @@ class LoadReporterConfig:
 class WorkerMetadata:
     """Stable identity fields reported with every load snapshot."""
 
+    worker_addr: str
     worker_type: int
     model: Optional[str]
     zone: Optional[str]
@@ -67,13 +68,15 @@ class WorkerMetadata:
             args: Resolved SGLang server configuration.
 
         Returns:
-            Frozen worker type, model, and zone metadata.
+            Frozen worker address, type, model, and zone metadata.
         """
         worker_type = {
             "prefill": pb.WORKER_TYPE_PREFILL,
             "decode": pb.WORKER_TYPE_DECODE,
         }.get(args.disaggregation_mode, pb.WORKER_TYPE_REGULAR)
+        worker_addr = f"{args.host}:{args.load_reporter_port}"
         return cls(
+            worker_addr=worker_addr,
             worker_type=worker_type,
             model=args.served_model_name,
             zone=args.load_reporter_zone,

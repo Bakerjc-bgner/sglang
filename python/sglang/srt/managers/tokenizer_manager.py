@@ -82,8 +82,6 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
-    LoadReporterStartIpcReqOutput,
-    LoadReporterStateBroadcastReq,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ScaleElasticEPReqInput,
@@ -533,10 +531,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
 
-        # IPC components for multi-worker load reporter — attached by http_server.
-        self._load_reporter_control_proxy: Optional[Any] = None
-        self._load_reporter_refresh_notifier: Optional[Any] = None
-
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
         # Request logging
@@ -696,15 +690,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
-                # Load reporter IPC response handlers (multi-worker mode)
-                (
-                    LoadReporterStartIpcReqOutput,
-                    self._handle_load_reporter_start_response,
-                ),
-                (
-                    LoadReporterStateBroadcastReq,
-                    self._handle_load_reporter_state_broadcast,
-                ),
             ]
         )
         self.init_communicators(self.server_args)
@@ -771,43 +756,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # path are left untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
             raise
-
-    def attach_load_reporter_ipc_components(self, proxy: Any, notifier: Any) -> None:
-        """Attach IPC proxy and notifier for multi-worker load reporter.
-
-        Called by the http_server lifespan in multi-worker mode.
-        """
-        self._load_reporter_control_proxy = proxy
-        self._load_reporter_refresh_notifier = notifier
-
-    def _handle_load_reporter_start_response(
-        self, response: LoadReporterStartIpcReqOutput
-    ) -> None:
-        """Handle LoadReporterStartIpcReqOutput from router.
-
-        Routes the response to the attached proxy, which correlates it to
-        the pending start_reporting future.
-        """
-        if self._load_reporter_control_proxy is None:
-            logger.error("Received LoadReporterStartIpcReqOutput but no proxy attached")
-            return
-        self._load_reporter_control_proxy.handle_response(response)
-
-    def _handle_load_reporter_state_broadcast(
-        self, state: LoadReporterStateBroadcastReq
-    ) -> None:
-        """Handle LoadReporterStateBroadcastReq from router.
-
-        Routes the state to the attached notifier, which activates / deactivates
-        the refresh coalescing loop.
-        """
-        if self._load_reporter_refresh_notifier is None:
-            logger.debug(
-                "Received LoadReporterStateBroadcastReq but no notifier attached "
-                "(single-worker mode or multi-worker pre-start)"
-            )
-            return
-        self._load_reporter_refresh_notifier.handle_state(state)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool

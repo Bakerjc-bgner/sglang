@@ -22,7 +22,6 @@ from sglang.srt.load_reporter.config import (
     WorkerMetadata,
 )
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
-from sglang.srt.load_reporter.registration import WorkerIdentity
 from sglang.srt.load_reporter.report_builder import ReportBuilder, SequenceAllocator
 from sglang.srt.load_reporter.sampler import LoadSampler
 from sglang.srt.load_reporter.store import LatestSnapshotStore
@@ -45,7 +44,7 @@ class _RouterSession:
         lease_ttl_ms: int,
         store: LatestSnapshotStore,
         builder: ReportBuilder,
-        identity: WorkerIdentity,
+        identity: WorkerMetadata,
         on_close: Any,
     ) -> None:
         self._router_id = router_id
@@ -103,7 +102,7 @@ class _RouterSession:
         Used by the runtime's timeout shutdown path to avoid the replaced
         session being deleted from the table by a stale on_close callback.
         """
-        self._on_close = lambda _rid: None  # defuse callback before cancel
+        self._on_close = lambda _rid, _session: None  # defuse callback before cancel
         self._task.cancel()
 
     async def wait_stopped(self) -> None:
@@ -202,15 +201,6 @@ class LoadReporterRuntime:
         self._worker_metadata = WorkerMetadata.from_server_args(server_args)
         self._snapshot_source = snapshot_source
 
-        # Process-constant worker identity (Router dials in; we self-report).
-        worker_addr = f"{server_args.host}:{server_args.load_reporter_port}"
-        self._identity = WorkerIdentity(
-            worker_addr=worker_addr,
-            worker_type=self._worker_metadata.worker_type,
-            model=self._worker_metadata.model,
-            zone=self._worker_metadata.zone,
-        )
-
         self._store = LatestSnapshotStore()
         self._builder = ReportBuilder(
             str(uuid.uuid4()),
@@ -256,7 +246,7 @@ class LoadReporterRuntime:
             lease_ttl_ms=lease_ttl_ms,
             store=self._store,
             builder=self._builder,
-            identity=self._identity,
+            identity=self._worker_metadata,
             on_close=self._on_session_closed,
         )
         self._sessions[router_id] = session
