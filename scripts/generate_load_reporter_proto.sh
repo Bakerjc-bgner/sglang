@@ -19,6 +19,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROTO_SRC="sglang/router/loadmonitor/v1/load_monitor.proto"
 DEST_DIR="${REPO_ROOT}/python/sglang/srt/load_reporter/proto"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+GRPCIO_TOOLS_VERSION="1.78.0"
+PROTOBUF_GENCODE_VERSION="6.31.1"
+
+installed_grpcio_tools_version="$("${PYTHON_BIN}" -c \
+    'from importlib.metadata import version; print(version("grpcio-tools"))' \
+    2>/dev/null || true)"
+if [[ "${installed_grpcio_tools_version}" != "${GRPCIO_TOOLS_VERSION}" ]]; then
+    echo "ERROR: load reporter codegen requires grpcio-tools==${GRPCIO_TOOLS_VERSION}; found ${installed_grpcio_tools_version:-not installed}." >&2
+    echo "Set PYTHON_BIN to a Python environment containing the pinned generator." >&2
+    exit 1
+fi
 
 # Absolute import alias that grpc_tools emits for this proto path.
 # We replace it with a relative import so the existing import path is stable.
@@ -40,7 +52,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 
 (
     cd "${REPO_ROOT}"
-    python3 -m grpc_tools.protoc \
+    "${PYTHON_BIN}" -m grpc_tools.protoc \
         -I proto \
         --python_out="${TMP_DIR}" \
         --grpc_python_out="${TMP_DIR}" \
@@ -54,6 +66,11 @@ if [[ ! -f "${GENERATED_PB2}" || ! -f "${GENERATED_GRPC}" ]]; then
     echo "ERROR: protoc did not produce expected output files in ${TMP_DIR}" >&2
     exit 1
 fi
+
+grep -q "^# Protobuf Python Version: ${PROTOBUF_GENCODE_VERSION}$" "${GENERATED_PB2}" \
+    || { echo "ERROR: generated protobuf code does not target ${PROTOBUF_GENCODE_VERSION}" >&2; exit 1; }
+grep -q "^GRPC_GENERATED_VERSION = '${GRPCIO_TOOLS_VERSION}'$" "${GENERATED_GRPC}" \
+    || { echo "ERROR: generated gRPC code does not target ${GRPCIO_TOOLS_VERSION}" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Post-process: rewrite absolute import → relative import in the grpc file

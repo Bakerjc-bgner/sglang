@@ -8,17 +8,24 @@ Asserts wire-contract invariants WITHOUT starting a server:
   - Preserved LoadReport field numbers (must never change)
 """
 
-import pytest
+import ast
+import re
+from pathlib import Path
+
 from sglang.srt.load_reporter.proto import load_monitor_pb2
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_PROTO_PACKAGE = _REPO_ROOT / "python/sglang/srt/load_reporter/proto"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _service():
     return load_monitor_pb2.DESCRIPTOR.services_by_name["LoadMonitorService"]
@@ -39,9 +46,35 @@ def _fields_by_number(msg_name):
     return {f.number: f.name for f in _message(msg_name).fields}
 
 
+class TestGeneratedRuntimeCompatibility:
+    def test_protobuf_gencode_targets_declared_minimum(self):
+        source = (_PROTO_PACKAGE / "load_monitor_pb2.py").read_text()
+        match = re.search(r"^# Protobuf Python Version: (\S+)$", source, re.MULTILINE)
+
+        assert match is not None
+        assert match.group(1) == "6.31.1"
+
+    def test_grpc_gencode_targets_declared_minimum(self):
+        source = (_PROTO_PACKAGE / "load_monitor_pb2_grpc.py").read_text()
+        module = ast.parse(source)
+        generated_version = next(
+            node.value.value
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "GRPC_GENERATED_VERSION"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+        )
+
+        assert generated_version == "1.78.0"
+
+
 # ---------------------------------------------------------------------------
 # Service contract
 # ---------------------------------------------------------------------------
+
 
 class TestServiceDescriptor:
     def test_full_service_name(self):
@@ -52,16 +85,20 @@ class TestServiceDescriptor:
 
     def test_monitor_is_client_streaming(self):
         method = _service().methods_by_name["Monitor"]
-        assert method.client_streaming is True, "Monitor must be client-streaming (bidi)"
+        assert (
+            method.client_streaming is True
+        ), "Monitor must be client-streaming (bidi)"
 
     def test_monitor_is_server_streaming(self):
         method = _service().methods_by_name["Monitor"]
-        assert method.server_streaming is True, "Monitor must be server-streaming (bidi)"
+        assert (
+            method.server_streaming is True
+        ), "Monitor must be server-streaming (bidi)"
 
     def test_report_rpc_removed(self):
-        assert "Report" not in _service().methods_by_name, (
-            "Old Report RPC must be removed; only Monitor should exist"
-        )
+        assert (
+            "Report" not in _service().methods_by_name
+        ), "Old Report RPC must be removed; only Monitor should exist"
 
     def test_only_monitor_method_exists(self):
         assert list(_service().methods_by_name.keys()) == ["Monitor"]
@@ -70,6 +107,7 @@ class TestServiceDescriptor:
 # ---------------------------------------------------------------------------
 # RouterFrame oneof
 # ---------------------------------------------------------------------------
+
 
 class TestRouterFrame:
     def test_has_payload_oneof(self):
@@ -96,6 +134,7 @@ class TestRouterFrame:
 # WorkerFrame oneof
 # ---------------------------------------------------------------------------
 
+
 class TestWorkerFrame:
     def test_has_payload_oneof(self):
         assert "payload" in _message("WorkerFrame").oneofs_by_name
@@ -116,6 +155,7 @@ class TestWorkerFrame:
 # ---------------------------------------------------------------------------
 # Preserved LoadReport field numbers
 # ---------------------------------------------------------------------------
+
 
 class TestLoadReportFieldNumbers:
     def test_source_instance_id_is_1(self):
