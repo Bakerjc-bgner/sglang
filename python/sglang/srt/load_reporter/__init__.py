@@ -2,7 +2,7 @@
 
 from typing import Any, Optional
 
-__all__ = ["LoadReporterRuntime", "describe_optional_dependency_error"]
+__all__ = ["LoadReporterRuntime", "LoadReporterLifecycle", "describe_optional_dependency_error"]
 
 
 def describe_optional_dependency_error(exc: BaseException) -> Optional[str]:
@@ -60,4 +60,8 @@ def __getattr__(name: str) -> Any:
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         return LoadReporterRuntime
+    if name == "LoadReporterLifecycle":
+        from sglang.srt.load_reporter.lifecycle import LoadReporterLifecycle
+
+        return LoadReporterLifecycle
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

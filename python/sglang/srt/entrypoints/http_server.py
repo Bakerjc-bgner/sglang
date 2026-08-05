@@ -276,7 +276,7 @@ async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
     sidecar = None
     warmup_thread = None
-    load_reporter_runtime = None
+    reporter = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -305,60 +305,15 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
-    # Embedded load reporter. Single-worker mode owns the runtime directly;
-    # multi-worker mode reaches the sole router-owned runtime through IPC.
-    tokenizer_manager = _global_state.tokenizer_manager
-    load_reporter_notifier = None  # multi-worker only; stored for shutdown cleanup
-    if server_args.tokenizer_worker_num == 1:
-        try:
-            from sglang.srt.load_reporter import describe_optional_dependency_error
-            from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-            from sglang.srt.load_reporter.sampler import (
-                TokenizerManagerLoadSnapshotSource,
-            )
-        except (ModuleNotFoundError, RuntimeError) as exc:
-            unsupported_reason = describe_optional_dependency_error(exc)
-            if unsupported_reason is None:
-                raise
-            fast_api_app.state.load_reporter_unsupported_reason = unsupported_reason
-            logger.info(
-                "Load reporter disabled because optional dependencies are unavailable: %s",
-                unsupported_reason,
-            )
-        else:
-            snapshot_source = TokenizerManagerLoadSnapshotSource(tokenizer_manager)
-            load_reporter_runtime = LoadReporterRuntime(
-                snapshot_source,
-                server_args,
-                active_changed=lambda active: logger.info(
-                    "Load reporter active=%s",
-                    active,
-                ),
-            )
-            tokenizer_manager.set_load_reporter_request_finished_hook(
-                load_reporter_runtime.notify_request_finished
-            )
-            fast_api_app.state.load_reporter_unsupported_reason = None
-    else:
-        from sglang.srt.load_reporter.ipc import (
-            LoadReporterControlProxy,
-            LoadReporterRefreshNotifier,
-        )
+    # Embedded load reporter lifecycle
+    from sglang.srt.load_reporter.lifecycle import LoadReporterLifecycle
 
-        proxy = LoadReporterControlProxy(tokenizer_manager._dispatch_to_scheduler)
-        notifier = LoadReporterRefreshNotifier(
-            worker_id=f"http-worker-{os.getpid()}",
-            send=tokenizer_manager._dispatch_to_scheduler,
-        )
-        tokenizer_manager.attach_load_reporter_ipc_components(proxy, notifier)
-        tokenizer_manager.set_load_reporter_request_event_hook(notifier.notify)
-        await notifier.start()
-
-        load_reporter_runtime = proxy
-        fast_api_app.state.load_reporter_unsupported_reason = None
-        load_reporter_notifier = notifier  # store for shutdown cleanup
-
-    fast_api_app.state.load_reporter_runtime = load_reporter_runtime
+    reporter = LoadReporterLifecycle.from_http_server(
+        server_args=server_args,
+        tokenizer_manager=_global_state.tokenizer_manager,
+        app_state=fast_api_app.state,
+    )
+    await reporter.start()
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -483,27 +438,11 @@ async def lifespan(fast_api_app: FastAPI):
                 sidecar.stop()
             except Exception:
                 logger.exception("Failed to stop sidecar")
-        # Detach both hooks before closing so no late request can wake a
-        # torn-down sampler or notifier; a reporter shutdown error must not
-        # skip the native gRPC / tool-server / warmup cleanup below.
-        if load_reporter_runtime is not None:
-            _global_state.tokenizer_manager.set_load_reporter_request_finished_hook(
-                None
-            )
-            _global_state.tokenizer_manager.set_load_reporter_request_event_hook(None)
-            try:
-                await load_reporter_runtime.close()
-            except Exception:
-                logger.exception("Load reporter shutdown failed")
-            # Also close notifier if multi-worker
-            if load_reporter_notifier is not None:
-                try:
-                    await load_reporter_notifier.close()
-                except Exception:
-                    logger.exception("Load reporter notifier shutdown failed")
-                _global_state.tokenizer_manager.attach_load_reporter_ipc_components(
-                    None, None
-                )
+        # Close load reporter lifecycle (detaches hooks and closes runtime/notifier)
+        try:
+            await reporter.close()
+        except Exception:
+            logger.exception("Load reporter shutdown failed")
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()
