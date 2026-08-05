@@ -53,6 +53,21 @@ class FakeSnapshotSource:
         return frozenset(range(self._dp_size))
 
 
+class HangingSnapshotSource:
+    """Snapshot source whose in-flight read only ends when cancelled."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def get_loads(self) -> list:
+        self.started.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    def expected_dp_ranks(self) -> frozenset:
+        return frozenset({0})
+
+
 async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> list:
     """Drain up to count non-None items from q within timeout seconds."""
     items = []
@@ -454,6 +469,34 @@ class TestSamplerActivation:
             )
         finally:
             await rt.close()
+
+
+class TestShutdown:
+    @pytest.mark.asyncio
+    async def test_timeout_cancels_hanging_sampler_and_sessions(self, monkeypatch):
+        import sglang.srt.load_reporter.runtime as runtime_module
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        monkeypatch.setattr(runtime_module, "SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+        source = HangingSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        _, session = rt.register_session("r1", 1000, 3000)
+        await asyncio.wait_for(source.started.wait(), timeout=0.5)
+
+        sampler_task = rt._sampler._task
+        assert sampler_task is not None
+        try:
+            await asyncio.wait_for(rt.close(), timeout=0.5)
+
+            assert sampler_task.done()
+            assert session._task.done()
+            await asyncio.wait_for(rt.close(), timeout=0.1)
+        finally:
+            tasks = [sampler_task, session._task]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class TestDecoratorEvents:

@@ -213,18 +213,48 @@ class LoadSampler:
         """Shut down the background task gracefully.
 
         Sets the closing flag, wakes the loop, and awaits the task.
-        Idempotent: safe to call more than once.  Swallows any background
-        exception after logging it.
+        Idempotent: safe to call more than once. The sampler task is shielded
+        so cancellation of a bounded graceful close does not corrupt its
+        state; the owner can then cancel and join it explicitly.
         """
         self._active = False
         self._closing = True
         self._wake.set()
+        task = self._task
+        if task is None:
+            return
+
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Load reporter sampler task raised: %s", exc)
+        finally:
+            if task.done() and self._task is task:
+                self._task = None
+
+    def cancel(self) -> None:
+        """Request immediate cancellation of the sampler task."""
+        self._active = False
+        self._closing = True
+        self._wake.set()
         if self._task is not None:
-            try:
-                await self._task
-            except Exception as exc:
-                logger.warning("Load reporter sampler task raised: %s", exc)
-            self._task = None
+            self._task.cancel()
+
+    async def wait_stopped(self) -> None:
+        """Join a cancelled sampler task without propagating its result."""
+        task = self._task
+        if task is None:
+            return
+
+        try:
+            result = (await asyncio.gather(task, return_exceptions=True))[0]
+            if isinstance(result, Exception):
+                logger.warning("Load reporter sampler task raised: %s", result)
+        finally:
+            if task.done() and self._task is task:
+                self._task = None
 
     # ------------------------------------------------------------------
     # Internal helpers

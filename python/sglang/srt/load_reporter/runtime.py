@@ -241,6 +241,7 @@ class LoadReporterRuntime:
             server_args: SGLang server configuration.
         """
         self._closing = False
+        self._close_task: Optional[asyncio.Task[None]] = None
         self._config = LoadReporterConfig.from_server_args(server_args)
         self._worker_metadata = WorkerMetadata.from_server_args(server_args)
         self._snapshot_source = snapshot_source
@@ -373,34 +374,53 @@ class LoadReporterRuntime:
 
     async def close(self) -> None:
         """Bounded, idempotent shutdown."""
-        if self._closing:
-            return
-        self._closing = True
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(
+                self._close_impl(), name="load-reporter-runtime-close"
+            )
+        await asyncio.shield(self._close_task)
 
-        async def close_all() -> None:
-            await self._sampler.close()
-            sessions = list(self._sessions.values())
-            for s in sessions:
-                s.stop()
-            for s in sessions:
-                await s.wait_stopped()
+    async def _close_impl(self) -> None:
+        """Run one shared close attempt to completion for every caller."""
+        sessions = list(self._sessions.values())
+        for session in sessions:
+            session.stop()
+
+        force_close = False
 
         try:
-            await asyncio.wait_for(close_all(), SHUTDOWN_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                asyncio.gather(
+                    self._sampler.close(),
+                    *(session.wait_stopped() for session in sessions),
+                ),
+                SHUTDOWN_TIMEOUT_SECONDS,
+            )
         except asyncio.TimeoutError:
             logger.warning(
                 "Load reporter shutdown exceeded %.1fs; cancelling remaining tasks",
                 SHUTDOWN_TIMEOUT_SECONDS,
             )
-            await self._sampler.close()
-            # Hard-cancel any sessions that failed to converge.  cancel()
-            # defuses the on_close callback so it cannot corrupt the table.
-            remaining = list(self._sessions.values())
-            for s in remaining:
-                s.cancel()
-            if remaining:
-                await asyncio.gather(
-                    *(s._task for s in remaining), return_exceptions=True
-                )
+            force_close = True
+        except asyncio.CancelledError:
+            logger.warning(
+                "Load reporter graceful shutdown was cancelled; "
+                "cancelling remaining tasks"
+            )
+            force_close = True
         except Exception:
             logger.exception("Load reporter shutdown failed")
+            force_close = True
+
+        if force_close:
+            self._sampler.cancel()
+            for session in sessions:
+                session.cancel()
+            await asyncio.gather(
+                self._sampler.wait_stopped(),
+                *(session._task for session in sessions),
+                return_exceptions=True,
+            )
+
+        self._sessions.clear()
