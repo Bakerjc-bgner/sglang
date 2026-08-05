@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from sglang.srt.load_reporter.config import (
     SHUTDOWN_TIMEOUT_SECONDS,
@@ -27,6 +27,17 @@ from sglang.srt.load_reporter.sampler import LoadSampler
 from sglang.srt.load_reporter.store import LatestSnapshotStore
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_timing(
+    report_interval_ms: Optional[int] = None,
+    lease_ttl_ms: Optional[int] = None,
+) -> None:
+    """Reject non-positive session timing before mutating runtime state."""
+    if report_interval_ms is not None and report_interval_ms <= 0:
+        raise ValueError("report_interval_ms must be greater than zero")
+    if lease_ttl_ms is not None and lease_ttl_ms <= 0:
+        raise ValueError("lease_ttl_ms must be greater than zero")
 
 
 class _RouterSession:
@@ -45,19 +56,25 @@ class _RouterSession:
         store: LatestSnapshotStore,
         builder: ReportBuilder,
         identity: WorkerMetadata,
-        on_close: Any,
+        on_close: Callable[[str, "_RouterSession"], None],
+        on_schedule_changed: Callable[[], None],
     ) -> None:
+        _validate_timing(report_interval_ms, lease_ttl_ms)
+        now = time.monotonic()
         self._router_id = router_id
         self._report_interval_ms = report_interval_ms
         self._lease_ttl_ms = lease_ttl_ms
-        self._lease_expires_at: float = time.monotonic() + lease_ttl_ms / 1000.0
+        self._next_report_deadline = now + report_interval_ms / 1000.0
+        self._lease_expires_at = now + lease_ttl_ms / 1000.0
         self._store = store
         self._builder = builder
         self._identity = identity
         self._on_close = on_close
+        self._on_schedule_changed = on_schedule_changed
 
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         self._done: asyncio.Event = asyncio.Event()
+        self._config_changed: asyncio.Event = asyncio.Event()
         self._task: asyncio.Task = asyncio.create_task(
             self._run(), name=f"lr-session-{router_id}"
         )
@@ -85,16 +102,26 @@ class _RouterSession:
         report_interval_ms: Optional[int] = None,
         lease_ttl_ms: Optional[int] = None,
     ) -> None:
-        """Live-update interval and/or lease; also refreshes the lease."""
+        """Atomically update timing and re-anchor changed schedules from now."""
+        _validate_timing(report_interval_ms, lease_ttl_ms)
+        now = time.monotonic()
+
         if report_interval_ms is not None:
             self._report_interval_ms = report_interval_ms
+            self._next_report_deadline = now + report_interval_ms / 1000.0
         if lease_ttl_ms is not None:
             self._lease_ttl_ms = lease_ttl_ms
-        self.refresh_lease()
+        self._lease_expires_at = now + self._lease_ttl_ms / 1000.0
+
+        if report_interval_ms is not None or lease_ttl_ms is not None:
+            self._config_changed.set()
+        if report_interval_ms is not None:
+            self._on_schedule_changed()
 
     def stop(self) -> None:
         """Idempotent stop: signal the report loop to exit."""
         self._done.set()
+        self._config_changed.set()
 
     def cancel(self) -> None:
         """Hard-cancel the report task without triggering on_close.
@@ -145,36 +172,40 @@ class _RouterSession:
         """Background report loop: immediate first report, then periodic."""
         try:
             self._enqueue(self._build_report())
-            next_report_deadline = (
-                time.monotonic() + self._report_interval_ms / 1000.0
-            )
 
             while not self._done.is_set():
+                self._config_changed.clear()
                 now = time.monotonic()
                 sleep_sec = max(
                     0.0,
-                    min(next_report_deadline, self._lease_expires_at) - now,
+                    min(self._next_report_deadline, self._lease_expires_at) - now,
                 )
 
                 try:
-                    await asyncio.wait_for(self._done.wait(), timeout=sleep_sec)
-                    break  # done event fired
+                    await asyncio.wait_for(
+                        self._config_changed.wait(), timeout=sleep_sec
+                    )
                 except asyncio.TimeoutError:
                     pass
+
+                if self._done.is_set():
+                    break
+                if self._config_changed.is_set():
+                    continue
 
                 now = time.monotonic()
                 if now >= self._lease_expires_at:
                     logger.info("Lease expired for router_id=%s", self._router_id)
                     break
 
-                if now < next_report_deadline:
+                if now < self._next_report_deadline:
                     continue
 
                 self._enqueue(self._build_report())
                 interval_sec = self._report_interval_ms / 1000.0
-                next_report_deadline += interval_sec
-                if next_report_deadline <= now:
-                    next_report_deadline = now + interval_sec
+                self._next_report_deadline += interval_sec
+                if self._next_report_deadline <= now:
+                    self._next_report_deadline = now + interval_sec
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -247,6 +278,9 @@ class LoadReporterRuntime:
         """
         if self._closing:
             raise RuntimeError("load reporter is shutting down")
+        if not router_id or not router_id.strip():
+            raise ValueError("router_id must be non-empty")
+        _validate_timing(report_interval_ms, lease_ttl_ms)
 
         # Replace any existing session for this router_id.
         old = self._sessions.pop(router_id, None)
@@ -261,6 +295,7 @@ class LoadReporterRuntime:
             builder=self._builder,
             identity=self._worker_metadata,
             on_close=self._on_session_closed,
+            on_schedule_changed=self._on_schedule_changed,
         )
         self._sessions[router_id] = session
         self._on_schedule_changed()

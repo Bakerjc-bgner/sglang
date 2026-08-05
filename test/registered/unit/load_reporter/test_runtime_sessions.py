@@ -78,6 +78,30 @@ async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> lis
 
 class TestRegisterSession:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("router_id", "report_interval_ms", "lease_ttl_ms", "error"),
+        [
+            ("", 500, 3000, "router_id"),
+            ("   ", 500, 3000, "router_id"),
+            ("r1", 0, 3000, "report_interval_ms"),
+            ("r1", -1, 3000, "report_interval_ms"),
+            ("r1", 500, 0, "lease_ttl_ms"),
+            ("r1", 500, -1, "lease_ttl_ms"),
+        ],
+    )
+    async def test_register_rejects_invalid_session_config(
+        self, router_id, report_interval_ms, lease_ttl_ms, error
+    ):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        try:
+            with pytest.raises(ValueError, match=error):
+                rt.register_session(router_id, report_interval_ms, lease_ttl_ms)
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
     async def test_register_returns_ack(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
@@ -122,17 +146,76 @@ class TestRegisterSession:
 
 class TestUpdateConfig:
     @pytest.mark.asyncio
-    async def test_update_config_changes_interval(self):
+    async def test_update_config_reanchors_report_deadline(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
         try:
-            ack, session = rt.register_session("r1", 500, 3000)
-            session.update_config(report_interval_ms=20)
-            assert session.report_interval_ms == 20
-            # fast interval means we get multiple reports quickly
-            reports = await drain_queue(session.queue, 3, timeout=2.0)
-            assert len(reports) >= 2
+            _, session = rt.register_session("r1", 1000, 3000)
+            initial_report = await asyncio.wait_for(session.queue.get(), timeout=1.0)
+            assert initial_report is not None
+
+            session.update_config(report_interval_ms=30)
+
+            report = await asyncio.wait_for(session.queue.get(), timeout=0.2)
+            assert report is not None
+            assert session.report_interval_ms == 30
+        finally:
+            session.stop()
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_update_config_reanchors_lease_deadline(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        try:
+            _, session = rt.register_session("r1", 1000, 3000)
+            initial_report = await asyncio.wait_for(session.queue.get(), timeout=1.0)
+            assert initial_report is not None
+
+            session.update_config(lease_ttl_ms=30)
+
+            sentinel = await asyncio.wait_for(session.queue.get(), timeout=0.2)
+            assert sentinel is None
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_report_interval_update_reschedules_sampler(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = FakeSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, session = rt.register_session("r1", 1000, 3000)
+            await asyncio.sleep(0.1)
+            calls_before = source.get_loads_calls
+
+            session.update_config(report_interval_ms=30)
+            await asyncio.sleep(0.15)
+
+            assert source.get_loads_calls - calls_before >= 2
+        finally:
+            session.stop()
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_update_config_rejects_all_fields_atomically(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        try:
+            _, session = rt.register_session("r1", 500, 3000)
+            initial_report = await asyncio.wait_for(session.queue.get(), timeout=1.0)
+            assert initial_report is not None
+
+            with pytest.raises(ValueError, match="report_interval_ms"):
+                session.update_config(report_interval_ms=-1, lease_ttl_ms=1)
+
+            assert session.report_interval_ms == 500
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(session.queue.get(), timeout=0.05)
         finally:
             session.stop()
             await rt.close()

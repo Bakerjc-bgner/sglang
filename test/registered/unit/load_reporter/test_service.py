@@ -185,6 +185,117 @@ class TestContinuousReporting:
         await rt.close()
 
 
+class TestUpdateConfig:
+    @pytest.mark.asyncio
+    async def test_shorter_report_interval_takes_effect_from_update(self):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        server, port = await start_test_server(rt)
+        stub, channel = await make_stub(port)
+
+        async def frames() -> AsyncIterator[pb.RouterFrame]:
+            yield pb.RouterFrame(
+                register=pb.RegisterRequest(
+                    router_id="r1",
+                    report_interval_ms=1000,
+                    lease_ttl_ms=3000,
+                )
+            )
+            await asyncio.sleep(0.05)
+            yield pb.RouterFrame(
+                update_config=pb.UpdateConfigRequest(report_interval_ms=30)
+            )
+            await asyncio.sleep(0.2)
+
+        try:
+            call = stub.Monitor(frames())
+            received = await receive_frames(call, 5, timeout=1.0)
+            reports = [f for f in received if f.WhichOneof("payload") == "report"]
+            assert received[0].WhichOneof("payload") == "registered"
+            assert len(reports) >= 2
+        finally:
+            await channel.close()
+            await server.stop(grace=0)
+            await rt.close()
+
+
+class TestInvalidArguments:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("router_id", "report_interval_ms", "lease_ttl_ms"),
+        [
+            ("", 500, 3000),
+            ("r1", 0, 3000),
+            ("r1", 500, -1),
+        ],
+    )
+    async def test_invalid_register_yields_terminal_error(
+        self, router_id, report_interval_ms, lease_ttl_ms
+    ):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        server, port = await start_test_server(rt)
+        stub, channel = await make_stub(port)
+
+        async def frames() -> AsyncIterator[pb.RouterFrame]:
+            yield pb.RouterFrame(
+                register=pb.RegisterRequest(
+                    router_id=router_id,
+                    report_interval_ms=report_interval_ms,
+                    lease_ttl_ms=lease_ttl_ms,
+                )
+            )
+
+        try:
+            call = stub.Monitor(frames())
+            received = await receive_frames(call, 2, timeout=1.0)
+            assert len(received) == 1
+            assert received[0].WhichOneof("payload") == "error"
+            assert received[0].error.code == "INVALID_ARGUMENT"
+        finally:
+            await channel.close()
+            await server.stop(grace=0)
+            await rt.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_interval_ms", [0, -1])
+    async def test_invalid_update_yields_terminal_error(self, invalid_interval_ms):
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        server, port = await start_test_server(rt)
+        stub, channel = await make_stub(port)
+
+        async def frames() -> AsyncIterator[pb.RouterFrame]:
+            yield pb.RouterFrame(
+                register=pb.RegisterRequest(
+                    router_id="r1",
+                    report_interval_ms=1000,
+                    lease_ttl_ms=3000,
+                )
+            )
+            yield pb.RouterFrame(
+                update_config=pb.UpdateConfigRequest(
+                    report_interval_ms=invalid_interval_ms
+                )
+            )
+            await asyncio.sleep(0.05)
+
+        try:
+            call = stub.Monitor(frames())
+            received = await receive_frames(call, 4, timeout=1.0)
+            errors = [f for f in received if f.WhichOneof("payload") == "error"]
+            assert received[0].WhichOneof("payload") == "registered"
+            assert len(errors) == 1
+            assert errors[0].error.code == "INVALID_ARGUMENT"
+        finally:
+            await channel.close()
+            await server.stop(grace=0)
+            await rt.close()
+
+
 class TestIllegalFirstFrame:
     @pytest.mark.asyncio
     async def test_non_register_first_frame_yields_error(self):

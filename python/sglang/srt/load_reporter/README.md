@@ -134,6 +134,11 @@ service LoadMonitorService {
 - `RouterFrame` = `register | update_config | keep_alive | stop`. The first
   frame MUST be `register`; any other first frame yields
   `WorkerFrame(error=StreamError(code="INVALID_FIRST_FRAME"))`.
+- Registration timing must be positive and `router_id` must be non-empty.
+  `update_config` distinguishes absent fields from explicit values; every
+  present timing field must be positive and starts a new deadline when the
+  Worker accepts the frame. Invalid input terminates the stream with
+  `StreamError(code="INVALID_ARGUMENT")`.
 - `WorkerFrame` = `registered | report | error`. On valid register the Worker
   sends the ack + current snapshot, then periodic `LoadReport`s.
 - Same `router_id` re-registering on a new stream replaces the old session;
