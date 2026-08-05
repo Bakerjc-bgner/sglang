@@ -222,11 +222,6 @@ async def serve_grpc(server_args, model_info=None):
                 exc_info=True,
             )
 
-        # Standalone SMG RPC load reporter: same runtime/service/proto/decorator
-        # as HTTP. Snapshot source is this GrpcRequestManager; the request-end
-        # COMPLETION comes from applying enable_load_monitor("request_lifecycle")
-        # to this one instance's bound generate_request. Started here (before the
-        # gRPC server accepts requests) so initial/periodic/request-end all work.
         if server_args.load_reporter_port is not None:
             from sglang.srt.load_reporter import start_load_reporter
             from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
@@ -280,8 +275,6 @@ async def serve_grpc(server_args, model_info=None):
     try:
         await _serve_grpc(server_args, model_info, **serve_kwargs)
     finally:
-        # Close reporter first: stops sessions/sampling and restores the
-        # shadowed generate_request on the request manager. Idempotent.
         if reporter_handle is not None:
             try:
                 await reporter_handle.close()

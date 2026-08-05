@@ -4,20 +4,11 @@ Standalone SMG RPC bypasses FastAPI: SGLang imports ``smg-grpc-servicer`` and,
 in the ``on_request_manager_ready`` callback, starts the SAME reporter runtime
 + ``grpc.aio`` service on ``--load-reporter-port`` and applies the SAME
 ``enable_load_monitor("request_lifecycle")`` decorator to the current
-``GrpcRequestManager.generate_request`` bound method.  A real ``grpc.aio`` fake
-Router dials into the reporter port (distinct from the SMG inference port) and
-observes register ack + initial + periodic reports.
-
-Scope note — request-end wake:
-    Driving a real generate here would require the EXTERNAL smg gRPC *inference*
-    stub (``smg_grpc_proto``), which is not part of this repository.  The
-    request-end -> COMPLETION -> sampler-wake -> new report behaviour for the
-    standalone *bound-method* decorator path is verified for real (real
-    ``grpc.aio`` reporter + real decorator on a bound ``generate_request``) in
-    ``test/registered/unit/load_reporter/test_standalone_rpc_lifecycle.py``
-    (``TestReporterEnabledWithCapability::test_request_end_wakes_sampler``).
-    This E2E therefore asserts the standalone reporter wire contract without
-    fabricating the external inference stub.
+``GrpcRequestManager.generate_request`` bound method. A real ``grpc.aio`` fake
+Router dials into the reporter port (distinct from the SMG inference port), and
+the external SMG inference stub drives a real generation request. The next
+deadline report must contain a snapshot collected by the request-end wake,
+rather than one collected by ordinary interval sampling at that deadline.
 
 Requires a GPU + model + ``smg-grpc-servicer`` + the load-reporter extra (CUDA
 CI); it cannot run on a CPU-only host without those packages.
@@ -30,10 +21,12 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from typing import Any, AsyncIterator, List, Optional
 
 import grpc
 import grpc.aio
+from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 from sglang.srt.load_reporter.proto import load_monitor_pb2_grpc as pb_grpc
@@ -129,6 +122,10 @@ class FakeRouterClient:
         with self._lock:
             return len(self._reports)
 
+    def reports_snapshot(self) -> tuple:
+        with self._lock:
+            return tuple(self._reports)
+
     def wait_for_reports(self, n: int, timeout: float = 10.0) -> bool:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
@@ -191,7 +188,7 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
             kill_process_tree(process.pid)
             cls.process = None
 
-    def test_reporter_on_own_port_register_initial_and_periodic(self) -> None:
+    def test_real_inference_refreshes_next_deadline_report(self) -> None:
         self.assertTrue(
             self.reporter_up, "standalone reporter port never started listening"
         )
@@ -199,19 +196,55 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
         self.assertNotEqual(self.reporter_port, self.smg_port)
         self.assertNotEqual(self.reporter_port, self.sidecar_port)
 
-        router = FakeRouterClient(self.host, self.reporter_port, interval_ms=60_000)
+        report_interval_ms = 10_000
+        router = FakeRouterClient(
+            self.host,
+            self.reporter_port,
+            interval_ms=report_interval_ms,
+            lease_ttl_ms=30_000,
+        )
         router.start()
         try:
             self.assertTrue(
                 router.wait_for_register(),
                 "standalone reporter did not accept the register stream",
             )
-            # Register-time initial report arrives immediately even though the
-            # periodic interval is 60s (proves it is not timer-driven).
             self.assertTrue(
                 router.wait_for_reports(1, timeout=8.0),
                 "no initial report after register under a long interval",
             )
+
+            inference_started_ms = int(time.time() * 1000)
+            channel = grpc.insecure_channel(f"{self.host}:{self.smg_port}")
+            try:
+                stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(channel)
+                request = sglang_scheduler_pb2.GenerateRequest(
+                    request_id=f"load-reporter-e2e-{uuid.uuid4().hex}",
+                    tokenized=sglang_scheduler_pb2.TokenizedInput(
+                        input_ids=[123, 456, 789, 234],
+                        original_text="load reporter e2e",
+                    ),
+                    sampling_params=sglang_scheduler_pb2.SamplingParams(
+                        temperature=0.0,
+                        max_new_tokens=1,
+                    ),
+                    stream=False,
+                )
+                responses = list(stub.Generate(request, timeout=60))
+            finally:
+                channel.close()
+            self.assertTrue(responses and responses[-1].HasField("complete"))
+            inference_finished_ms = int(time.time() * 1000)
+
+            self.assertTrue(
+                router.wait_for_reports(2, timeout=report_interval_ms / 1000 + 3),
+                "no deadline report after real standalone inference",
+            )
+            report = router.reports_snapshot()[1]
+            self.assertTrue(report.ranks, "post-inference report has no rank snapshot")
+            snapshot_time_ms = max(rank.snapshot_time_unix_ms for rank in report.ranks)
+            self.assertGreaterEqual(snapshot_time_ms, inference_started_ms)
+            self.assertLessEqual(snapshot_time_ms, inference_finished_ms + 2_000)
         finally:
             router.stop()
 

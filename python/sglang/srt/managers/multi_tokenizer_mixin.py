@@ -461,9 +461,6 @@ class MultiTokenizerRouter:
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
-        # Sole owner of the load reporter in multi-tokenizer mode: binds the
-        # reporter port on the router loop. HTTP workers only forward coalesced
-        # refresh hints here over IPC. None when --load-reporter-port is unset.
         self._load_reporter_handle: Optional[Any] = self._start_load_reporter_owner()
 
     def _run_loop(self):
@@ -499,10 +496,6 @@ class MultiTokenizerRouter:
         )
         # Drain anything already queued before the fd was registered.
         self.load_snapshot_reader.poll()
-
-    # ------------------------------------------------------------------
-    # Load reporter ownership (router is the sole owner in multi-tokenizer mode)
-    # ------------------------------------------------------------------
 
     def _start_load_reporter_owner(self) -> Optional[Any]:
         """Start the router-owned reporter on the router loop (sole port owner).

@@ -2,10 +2,9 @@
 
 This module owns the single background task that calls
 ``snapshot_source.get_loads()`` and forwards results into
-``LatestSnapshotStore``.  All other components (MonitorTask, request-end
-hooks) funnel their wake-up signals through the three synchronous
-notification methods; only one in-flight ``get_loads`` call is ever active
-at a time.
+``LatestSnapshotStore``. Router sessions and request-end hooks funnel wake-up
+signals through synchronous notification methods; only one in-flight
+``get_loads`` call is ever active at a time.
 
 Coalescing rule (section 8.4 of the design doc):
   idle  + trigger  -> start refresh
@@ -34,9 +33,9 @@ class LoadSnapshotSource(Protocol):
     """Minimal protocol for a load-snapshot data source.
 
     ``LoadSampler`` depends only on this protocol, not on any concrete
-    manager type.  Two adapters are provided: one that wraps a live
-    ``TokenizerManager`` (single-tokenizer path) and one that wraps a
-    shared-memory reader (router path, multi-tokenizer future).
+    manager type. Two adapters are provided: one that wraps a live manager
+    (single-owner path) and one that wraps the router's shared-memory reader
+    (multi-tokenizer path).
     """
 
     async def get_loads(self) -> list:

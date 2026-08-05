@@ -389,9 +389,7 @@ class TestHttpLifecycleAdapter:
         owner = FakeOwner(port=port)
         args = make_server_args(port=port)
         with pytest.raises(RuntimeError, match="startup failed"):
-            async with http_load_reporter_lifespan(
-                args, owner, single_tokenizer=True
-            ):
+            async with http_load_reporter_lifespan(args, owner, single_tokenizer=True):
                 raise RuntimeError("startup failed")
 
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -527,6 +525,71 @@ class TestHandleDelegation:
             assert handle.update_expected_dp_ranks(range(2)) is False
         finally:
             await handle.close()
+
+    @pytest.mark.asyncio
+    async def test_worker_completion_wakes_owner_sampler_before_timer(self):
+        from sglang.srt.load_reporter.lifecycle import start_load_reporter
+        from sglang.srt.managers.io_struct import LoadReporterRefreshIpcReq
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        source = FakeSnapshotSource()
+        owner_handle = await start_load_reporter(
+            make_server_args(port=port), source, event_owner=None
+        )
+        assert owner_handle is not None
+        worker_handle = None
+        channel = None
+        try:
+            stub, channel = await start_client(port)
+
+            async def frames() -> AsyncIterator[pb.RouterFrame]:
+                yield pb.RouterFrame(
+                    register=pb.RegisterRequest(
+                        router_id="multi-owner",
+                        report_interval_ms=100_000,
+                        lease_ttl_ms=100_000,
+                    )
+                )
+                await asyncio.sleep(1.0)
+
+            call = stub.Monitor(frames())
+            await receive_frames(call, 2, timeout=1.0)
+
+            worker = FakeWorkerOwner(port=port)
+
+            def dispatch(message: Any) -> None:
+                worker.sent.append(message)
+                if isinstance(message, LoadReporterRefreshIpcReq):
+                    owner_handle.notify_refresh()
+
+            worker._dispatch_to_scheduler = dispatch
+            generate = worker.make_generate()
+            worker_handle = await start_load_reporter(
+                worker.server_args, None, event_owner=worker
+            )
+            assert worker_handle is not None
+            calls_before = source.get_loads_calls
+
+            assert [item async for item in generate(worker)] == [0, 1]
+            deadline = asyncio.get_running_loop().time() + 0.5
+            while (
+                source.get_loads_calls == calls_before
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.01)
+
+            assert any(isinstance(m, LoadReporterRefreshIpcReq) for m in worker.sent)
+            assert source.get_loads_calls > calls_before
+        finally:
+            if worker_handle is not None:
+                await worker_handle.close()
+            if channel is not None:
+                await channel.close()
+            await owner_handle.close()
 
 
 class TestLifecycleShadowRestoration:

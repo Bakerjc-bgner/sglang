@@ -3,8 +3,8 @@
 ``LoadReporterRuntime`` is the composition root: it constructs the store,
 builder, sampler, and session table, wires them into one asyncio event loop,
 and exposes the seams the serving layer uses: ``register_session`` (inbound
-Router sessions), ``notify_refresh`` / ``notify_request_finished`` /
-``notify_source_changed`` (data-plane refresh), and ``close``
+Router sessions), ``notify_refresh`` / ``notify_source_changed`` (data-plane
+refresh), and ``close``
 (bounded shutdown). Nothing here computes load metrics.
 """
 
@@ -203,9 +203,7 @@ class _RouterSession:
             finally:
                 sample_wait.cancel()
                 config_wait.cancel()
-                await asyncio.gather(
-                    sample_wait, config_wait, return_exceptions=True
-                )
+                await asyncio.gather(sample_wait, config_wait, return_exceptions=True)
 
     async def _run(self) -> None:
         """Background report loop: sampled first report, then periodic."""
@@ -262,7 +260,9 @@ class _RouterSession:
             try:
                 self._on_close(self._router_id, self)
             except Exception:
-                logger.exception("on_close callback failed for router_id=%s", self._router_id)
+                logger.exception(
+                    "on_close callback failed for router_id=%s", self._router_id
+                )
 
 
 class LoadReporterRuntime:
@@ -391,13 +391,6 @@ class LoadReporterRuntime:
                 self._sampler.notify_refresh()
         except Exception:
             logger.exception("Load reporter notify_refresh failed")
-
-    def notify_request_finished(self) -> None:
-        """Synchronous, non-throwing request-end refresh signal."""
-        try:
-            self.notify_refresh()
-        except Exception:
-            logger.exception("Load reporter request-finished notification failed")
 
     def notify_source_changed(self) -> None:
         """Signal that the snapshot source may have new data."""

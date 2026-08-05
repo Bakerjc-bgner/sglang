@@ -39,9 +39,9 @@ the snapshot source differ.
 
 | Serving mode | Reporter start site | Snapshot source | Request-end hint | Sampling |
 |---|---|---|---|---|
-| HTTP | FastAPI lifespan (`start_load_reporter`) | `TokenizerManager` | static `@enable_load_monitor` on `generate_request` | initial + periodic + request-end wake |
+| HTTP | FastAPI lifespan (`http_load_reporter_lifespan`) | `TokenizerManager` | static `@enable_load_monitor` on `generate_request` | initial + periodic + request-end wake |
 | native gRPC (`--grpc-port`) | reuses the same FastAPI lifespan (no second listener) | `TokenizerManager` | same static decorator | initial + periodic + request-end wake |
-| embedded Engine | `Engine.__init__` (`start_load_reporter`) | `TokenizerManager` | same static decorator | initial + periodic + request-end wake |
+| embedded Engine | `Engine.__init__` (`start_load_reporter_in_background`) | `TokenizerManager` snapshot reader | same static decorator | initial + periodic + request-end wake |
 | multi-tokenizer HTTP / native gRPC | sole `MultiTokenizerRouter` owns the port; HTTP workers bind an IPC notifier | Router shared-memory snapshot reader | HTTP workers coalesce refresh over IPC to the sole owner | initial + periodic + request-end wake |
 | standalone SMG RPC (`--smg-grpc-mode`) | `grpc_server.py::_on_request_manager_ready` (`start_load_reporter`) | `GrpcRequestManager.get_loads(include=["core"])` | same decorator applied at runtime to the current instance's bound `generate_request` | initial + periodic + request-end wake |
 
@@ -170,14 +170,14 @@ store has never completed a full snapshot.
 The external Router's paired reporter-port configuration is a delivery contract
 only; its parameter name is chosen by the Router owner and is not defined here.
 
-Reporter-internal transport/lifecycle constants live in `config.py`
-(`SHUTDOWN_TIMEOUT_SECONDS`, etc.) and are intentionally not CLI arguments.
+Reporter-internal lifecycle constants live in `config.py` and are intentionally
+not CLI arguments.
 
 ## Module layout
 
 | File | Responsibility |
 |---|---|
-| `lifecycle.py` | `start_load_reporter` composition root and `LoadReporterHandle`. |
+| `lifecycle.py` | Composition root plus HTTP-lifespan and background-loop ownership helpers. |
 | `decorator.py` | `enable_load_monitor(kind)` / `bind_load_monitor(owner, notify)`; one shared async-generator finalization helper for both the static and bound-method `request_lifecycle` paths. |
 | `service.py` | `LoadMonitorService.Monitor` bidi handler (depends only on runtime + proto). |
 | `runtime.py` | `LoadReporterRuntime`: inbound Router session table, sampler wiring, bounded shutdown. |
@@ -190,9 +190,8 @@ Reporter-internal transport/lifecycle constants live in `config.py`
 
 ## Threading and async model
 
-- Every reporter component for a given owner shares that owner's asyncio loop
-  (FastAPI/TokenizerManager loop, the router's background loop, or the standalone
-  server loop).
+- Reporter components share one owned asyncio loop: the serving loop for HTTP,
+  router, and standalone modes, or a dedicated background loop for Engine.
 - Single-flight sampler: at most one `get_loads()` in flight; hints only set a
   wake event.
 - Request-end hooks are synchronous and non-throwing; a callback exception is
@@ -211,10 +210,9 @@ Reporter-internal transport/lifecycle constants live in `config.py`
 - E2E (GPU + model, CUDA CI) under `test/registered/tokenizer/`: a real
   `grpc.aio` fake Router dials in for single-owner, multi-owner, and standalone
   SMG modes. These require a GPU/model (and `smg-grpc-servicer` for standalone),
-  so they do not run on CPU-only hosts. The standalone request-end→wake behavior
-  for the bound-method path is proven at integration level in
-  `test/registered/unit/load_reporter/test_standalone_rpc_lifecycle.py`
-  because driving a real generate needs the external smg inference stub.
+  so they do not run on CPU-only hosts. The standalone test uses the SMG
+  inference stub to perform a real generation and verifies that its request-end
+  wake supplies the snapshot used at the next report deadline.
 
 ## Known limitations
 
@@ -225,4 +223,3 @@ Reporter-internal transport/lifecycle constants live in `config.py`
 - The external Router client (discovery, retry, registry reconciliation,
   load-aware policy) is a separate prerequisite; until it ships, keep the
   reporter disabled and do not claim end-to-end load-aware routing.
-

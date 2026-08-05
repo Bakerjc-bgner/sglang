@@ -1,12 +1,9 @@
 """Frozen configuration structs for the embedded SGLang load reporter.
 
-``LoadReporterConfig`` carries the only timing knob exposed on ``ServerArgs``
-(the snapshot stale threshold).  ``WorkerMetadata`` carries the identity fields
-that are stable for the lifetime of the worker process.
-
-gRPC transport/lifecycle knobs (connect/close timeout, reconnect backoff,
-shutdown timeout) are reporter-internal implementation constants defined in
-this module in seconds; they are intentionally not surfaced as CLI arguments.
+``LoadReporterConfig`` carries the snapshot stale threshold exposed on
+``ServerArgs``. ``WorkerMetadata`` carries identity fields that are stable for
+the lifetime of the worker process. Internal lifecycle timeouts are expressed
+in seconds and are intentionally not surfaced as CLI arguments.
 
 Both classes are constructed via ``from_server_args`` factory methods so that
 callers never reach into ``ServerArgs`` directly after the reporter starts.
@@ -24,10 +21,6 @@ if TYPE_CHECKING:
 
 # Reporter-internal implementation constants (seconds). Not CLI arguments.
 INITIAL_SAMPLE_TIMEOUT_SECONDS = 1.0
-GRPC_CONNECT_TIMEOUT_SECONDS = 3.0
-GRPC_CLOSE_TIMEOUT_SECONDS = 0.5
-RECONNECT_INITIAL_SECONDS = 0.25
-RECONNECT_MAX_SECONDS = 5.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
