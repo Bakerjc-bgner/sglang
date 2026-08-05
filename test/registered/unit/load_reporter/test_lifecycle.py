@@ -217,7 +217,7 @@ async def test_close_is_idempotent_after_partial_start_failure():
 
 @pytest.mark.asyncio
 async def test_lifecycle_disabled_when_port_is_none():
-    """When load_reporter_port is None, lifecycle is no-op."""
+    """When load_reporter_port is None, start() is a no-op and close() is safe."""
     try:
         from sglang.srt.load_reporter.lifecycle import LoadReporterLifecycle
     except ImportError:
@@ -234,12 +234,14 @@ async def test_lifecycle_disabled_when_port_is_none():
         app_state=app_state,
     )
 
-    # Note: This test documents future behavior (stage 3)
-    # Currently lifecycle always tries to start
-    # In stage 3, load_reporter_port=None will make this a no-op
+    # start() must short-circuit without touching the tokenizer manager
+    await lifecycle.start()
 
-    # For now, just verify close is safe
+    assert not lifecycle._started
+    assert app_state.load_reporter_runtime is None
+    assert len(manager.attach_calls) == 0
+    assert len(manager.detach_calls) == 0
+
+    # close() after a no-op start must also be safe
     await lifecycle.close()
-
-    # Should be no-op if nothing was started
     assert len(manager.detach_calls) == 0

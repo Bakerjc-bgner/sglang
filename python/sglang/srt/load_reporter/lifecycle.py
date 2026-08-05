@@ -36,7 +36,6 @@ class LoadReporterLifecycle:
         server_args: ServerArgs,
         tokenizer_manager: TokenizerManager,
         app_state: State,
-        strategy: str,
     ) -> None:
         """Initialize lifecycle (does not start services).
 
@@ -44,12 +43,10 @@ class LoadReporterLifecycle:
             server_args: SGLang server configuration.
             tokenizer_manager: The tokenizer manager to attach hooks to.
             app_state: FastAPI app.state for storing runtime reference.
-            strategy: "single" or "multi" tokenizer mode.
         """
         self._server_args = server_args
         self._manager = tokenizer_manager
         self._app_state = app_state
-        self._strategy = strategy
         self._runtime: Optional[Any] = None
         self._notifier: Optional[Any] = None
         self._started = False
@@ -73,28 +70,30 @@ class LoadReporterLifecycle:
         Returns:
             A configured LoadReporterLifecycle instance.
         """
-        strategy = "single" if server_args.tokenizer_worker_num == 1 else "multi"
         return cls(
             server_args=server_args,
             tokenizer_manager=tokenizer_manager,
             app_state=app_state,
-            strategy=strategy,
         )
 
     async def start(self) -> None:
         """Start load reporter and install hooks.
 
+        Returns immediately if ``server_args.load_reporter_port`` is ``None``.
         Single-tokenizer mode creates a runtime and installs request hooks.
         Multi-tokenizer mode installs IPC proxy/notifier and starts the notifier.
 
         This method is idempotent.
         """
+        if self._server_args.load_reporter_port is None:
+            return
+
         if self._started or self._closed:
             return
 
         self._started = True
 
-        if self._strategy == "single":
+        if self._server_args.tokenizer_worker_num == 1:
             await self._start_single_tokenizer()
         else:
             await self._start_multi_tokenizer()
