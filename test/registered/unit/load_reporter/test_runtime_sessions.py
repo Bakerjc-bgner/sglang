@@ -134,6 +134,23 @@ class TestSnapshotSources:
 
         assert await source.get_loads() is expected_loads
 
+    def test_manager_source_tracks_elastic_worker_count(self):
+        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+
+        class Manager:
+            elastic_worker_count = 1
+
+        manager = Manager()
+        source = ManagerLoadSnapshotSource(manager, {0})
+
+        assert source.expected_dp_ranks() == frozenset({0})
+
+        manager.elastic_worker_count = 3
+        assert source.expected_dp_ranks() == frozenset({0, 1, 2})
+
+        manager.elastic_worker_count = 2
+        assert source.expected_dp_ranks() == frozenset({0, 1})
+
 
 # ---------------------------------------------------------------------------
 # Tests

@@ -51,9 +51,9 @@ class LoadSnapshotSource(Protocol):
 class ManagerLoadSnapshotSource:
     """Adapts a manager to the ``LoadSnapshotSource`` protocol.
 
-    The expected DP rank set is immutable, captured at construction.
-    Used for both TokenizerManager (single-tokenizer) and future
-    GrpcRequestManager (standalone SMG RPC).
+    The expected DP rank set follows ``manager.elastic_worker_count`` when the
+    manager exposes it, and otherwise falls back to the construction-time set.
+    Used for both TokenizerManager and GrpcRequestManager.
     """
 
     def __init__(
@@ -63,7 +63,7 @@ class ManagerLoadSnapshotSource:
         *,
         snapshot_reader: Optional[Any] = None,
     ) -> None:
-        """Wrap a manager with an immutable authoritative rank set.
+        """Wrap a manager with an authoritative rank fallback.
 
         Args:
             manager: Manager exposing get_loads(include=["core"]).
@@ -82,7 +82,14 @@ class ManagerLoadSnapshotSource:
         return await self._manager.get_loads(include=["core"])
 
     def expected_dp_ranks(self) -> frozenset[int]:
-        """Return the immutable authoritative DP rank set."""
+        """Return the manager's current authoritative DP rank set."""
+        worker_count = getattr(self._manager, "elastic_worker_count", None)
+        if (
+            isinstance(worker_count, int)
+            and not isinstance(worker_count, bool)
+            and worker_count > 0
+        ):
+            return frozenset(range(worker_count))
         return self._expected
 
 
