@@ -22,11 +22,16 @@ tears them down in reverse order on an idempotent ``close()``.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import logging
 import os
+import threading
 from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
+
+_BACKGROUND_OPERATION_TIMEOUT_SECONDS = 10.0
 
 
 class LoadReporterHandle:
@@ -102,6 +107,117 @@ class LoadReporterHandle:
                 self._restore()
             except Exception:
                 logger.exception("Load reporter method restore failed")
+
+
+class BackgroundLoadReporter:
+    """Own an async load reporter on a continuously running loop thread."""
+
+    def __init__(
+        self,
+        server_args: Any,
+        snapshot_source: Any,
+        event_owner: Optional[Any],
+    ) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="load-reporter-event-loop",
+            daemon=True,
+        )
+        self._handle: Optional[LoadReporterHandle] = None
+        self._unbind: Optional[Callable[[], None]] = None
+        self._closed = False
+        self._thread.start()
+
+        future = asyncio.run_coroutine_threadsafe(
+            start_load_reporter(server_args, snapshot_source, event_owner=None),
+            self._loop,
+        )
+        try:
+            self._handle = future.result(
+                timeout=_BACKGROUND_OPERATION_TIMEOUT_SECONDS
+            )
+            if event_owner is not None:
+                from sglang.srt.load_reporter.decorator import bind_load_monitor
+
+                self._unbind = bind_load_monitor(
+                    event_owner, lambda _reason, _count: self.notify_refresh()
+                )
+        except BaseException:
+            future.cancel()
+            self._stop_loop()
+            raise
+
+    def _run_loop(self) -> None:
+        """Run the owned event loop and clean up any residual tasks on exit."""
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.close()
+
+    def notify_refresh(self) -> None:
+        """Thread-safely forward a request-lifecycle refresh hint."""
+        handle = self._handle
+        if self._closed or handle is None:
+            return
+        try:
+            self._loop.call_soon_threadsafe(handle.notify_refresh)
+        except RuntimeError:
+            if not self._closed:
+                logger.exception("Load reporter background notification failed")
+
+    def close(self) -> None:
+        """Synchronously close the reporter and its event-loop thread."""
+        if self._closed:
+            return
+        self._closed = True
+
+        if self._unbind is not None:
+            try:
+                self._unbind()
+            except Exception:
+                logger.exception("Load reporter background unbind failed")
+            self._unbind = None
+
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            future = asyncio.run_coroutine_threadsafe(handle.close(), self._loop)
+            try:
+                future.result(timeout=_BACKGROUND_OPERATION_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                logger.warning("Timed out while closing background load reporter")
+            except Exception:
+                logger.exception("Background load reporter shutdown failed")
+
+        self._stop_loop()
+
+    def _stop_loop(self) -> None:
+        """Stop and join the owned loop thread."""
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=_BACKGROUND_OPERATION_TIMEOUT_SECONDS)
+
+
+def start_load_reporter_in_background(
+    server_args: Any,
+    snapshot_source: Any,
+    *,
+    event_owner: Optional[Any] = None,
+) -> Optional[BackgroundLoadReporter]:
+    """Start a synchronously owned reporter on a dedicated event-loop thread."""
+    if getattr(server_args, "load_reporter_port", None) is None:
+        return None
+    return BackgroundLoadReporter(server_args, snapshot_source, event_owner)
 
 
 async def start_load_reporter(

@@ -86,6 +86,29 @@ async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> lis
     return items
 
 
+class TestSnapshotSources:
+    @pytest.mark.asyncio
+    async def test_manager_source_can_read_without_entering_manager_event_loop(self):
+        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+
+        expected_loads = [object()]
+
+        class Reader:
+            def read_all(self):
+                return expected_loads
+
+        class Manager:
+            async def get_loads(self, include):
+                raise AssertionError("background reporter entered manager event loop")
+
+        reader = Reader()
+        source = ManagerLoadSnapshotSource(
+            Manager(), {0}, snapshot_reader=reader
+        )
+
+        assert await source.get_loads() is expected_loads
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------

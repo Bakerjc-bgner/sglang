@@ -56,18 +56,29 @@ class ManagerLoadSnapshotSource:
     GrpcRequestManager (standalone SMG RPC).
     """
 
-    def __init__(self, manager: Any, expected_dp_ranks: Collection[int]) -> None:
+    def __init__(
+        self,
+        manager: Any,
+        expected_dp_ranks: Collection[int],
+        *,
+        snapshot_reader: Optional[Any] = None,
+    ) -> None:
         """Wrap a manager with an immutable authoritative rank set.
 
         Args:
             manager: Manager exposing get_loads(include=["core"]).
             expected_dp_ranks: DP ranks required for a full snapshot.
+            snapshot_reader: Optional synchronous reader used when the reporter
+                runs on an event loop different from the manager's loop.
         """
         self._manager = manager
+        self._snapshot_reader = snapshot_reader
         self._expected: frozenset[int] = frozenset(expected_dp_ranks)
 
     async def get_loads(self) -> list:
         """Fetch core load snapshots from the wrapped manager."""
+        if self._snapshot_reader is not None:
+            return self._snapshot_reader.read_all()
         return await self._manager.get_loads(include=["core"])
 
     def expected_dp_ranks(self) -> frozenset[int]:

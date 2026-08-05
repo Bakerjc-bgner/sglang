@@ -282,6 +282,100 @@ class TestOwnerPath:
             await handle.close()
 
 
+class TestBackgroundOwnerPath:
+    @pytest.mark.asyncio
+    async def test_serves_periodic_reports_while_engine_caller_is_idle(self):
+        from sglang.srt.load_reporter.lifecycle import (
+            start_load_reporter_in_background,
+        )
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        reporter = start_load_reporter_in_background(
+            make_server_args(port=port), FakeSnapshotSource(), event_owner=None
+        )
+        assert reporter is not None
+        channel = None
+        try:
+            stub, channel = await start_client(port)
+
+            async def frames() -> AsyncIterator[pb.RouterFrame]:
+                yield pb.RouterFrame(
+                    register=pb.RegisterRequest(
+                        router_id="engine-router",
+                        report_interval_ms=40,
+                        lease_ttl_ms=10_000,
+                    )
+                )
+                await asyncio.sleep(0.5)
+
+            received = await receive_frames(stub.Monitor(frames()), 4, timeout=1.0)
+
+            assert received[0].WhichOneof("payload") == "registered"
+            reports = [
+                frame for frame in received if frame.WhichOneof("payload") == "report"
+            ]
+            assert len(reports) >= 2
+        finally:
+            if channel is not None:
+                await channel.close()
+            reporter.close()
+
+    @pytest.mark.asyncio
+    async def test_request_completion_wakes_background_sampler_thread_safely(self):
+        from sglang.srt.load_reporter.lifecycle import (
+            start_load_reporter_in_background,
+        )
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        source = FakeSnapshotSource()
+        owner = FakeOwner(port=port)
+        generate = owner.make_generate()
+        reporter = start_load_reporter_in_background(
+            make_server_args(port=port), source, event_owner=owner
+        )
+        assert reporter is not None
+        channel = None
+        try:
+            stub, channel = await start_client(port)
+
+            async def frames() -> AsyncIterator[pb.RouterFrame]:
+                yield pb.RouterFrame(
+                    register=pb.RegisterRequest(
+                        router_id="engine-router",
+                        report_interval_ms=100_000,
+                        lease_ttl_ms=100_000,
+                    )
+                )
+                await asyncio.sleep(1.0)
+
+            call = stub.Monitor(frames())
+            await receive_frames(call, 2, timeout=1.0)
+            await asyncio.sleep(0.1)
+            calls_before = source.get_loads_calls
+
+            assert [item async for item in generate(owner)] == [0, 1, 2]
+            deadline = asyncio.get_running_loop().time() + 0.5
+            while (
+                source.get_loads_calls == calls_before
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.01)
+
+            assert source.get_loads_calls > calls_before
+        finally:
+            if channel is not None:
+                await channel.close()
+            reporter.close()
+
+
 # ---------------------------------------------------------------------------
 # Group 3: IPC-worker path — multi-tokenizer HTTP worker
 # ---------------------------------------------------------------------------
