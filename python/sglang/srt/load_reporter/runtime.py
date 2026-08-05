@@ -145,11 +145,16 @@ class _RouterSession:
         """Background report loop: immediate first report, then periodic."""
         try:
             self._enqueue(self._build_report())
+            next_report_deadline = (
+                time.monotonic() + self._report_interval_ms / 1000.0
+            )
 
             while not self._done.is_set():
-                interval_sec = self._report_interval_ms / 1000.0
-                time_to_lease = max(0.0, self._lease_expires_at - time.monotonic())
-                sleep_sec = min(interval_sec, time_to_lease)
+                now = time.monotonic()
+                sleep_sec = max(
+                    0.0,
+                    min(next_report_deadline, self._lease_expires_at) - now,
+                )
 
                 try:
                     await asyncio.wait_for(self._done.wait(), timeout=sleep_sec)
@@ -157,11 +162,19 @@ class _RouterSession:
                 except asyncio.TimeoutError:
                     pass
 
-                if time.monotonic() >= self._lease_expires_at:
+                now = time.monotonic()
+                if now >= self._lease_expires_at:
                     logger.info("Lease expired for router_id=%s", self._router_id)
                     break
 
+                if now < next_report_deadline:
+                    continue
+
                 self._enqueue(self._build_report())
+                interval_sec = self._report_interval_ms / 1000.0
+                next_report_deadline += interval_sec
+                if next_report_deadline <= now:
+                    next_report_deadline = now + interval_sec
         except asyncio.CancelledError:
             pass
         except Exception:

@@ -163,6 +163,33 @@ class TestUpdateConfig:
 
 class TestLeaseExpiry:
     @pytest.mark.asyncio
+    async def test_keepalive_does_not_publish_before_report_deadline(self):
+        """Lease renewals must not accelerate the periodic report cadence."""
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())
+        keepalive_task = None
+        try:
+            _, session = rt.register_session("r1", 500, 200)
+            initial_report = await asyncio.wait_for(session.queue.get(), timeout=1.0)
+            assert initial_report is not None
+
+            async def keep_lease_alive():
+                while True:
+                    await asyncio.sleep(0.05)
+                    session.refresh_lease()
+
+            keepalive_task = asyncio.create_task(keep_lease_alive())
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(session.queue.get(), timeout=0.3)
+        finally:
+            if keepalive_task is not None:
+                keepalive_task.cancel()
+                await asyncio.gather(keepalive_task, return_exceptions=True)
+            await rt.close()
+
+    @pytest.mark.asyncio
     async def test_lease_expiry_stops_session(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
