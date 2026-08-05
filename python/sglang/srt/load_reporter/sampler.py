@@ -150,6 +150,7 @@ class LoadSampler:
         snapshot_source: Any,
         store: Any,
         interval_provider: Callable[[], Optional[int]],
+        on_sample_completed: Optional[Callable[[], None]] = None,
     ) -> None:
         """Initialize the coalescing sampler.
 
@@ -157,10 +158,12 @@ class LoadSampler:
             snapshot_source: Source implementing the LoadSnapshotSource protocol.
             store: Destination receiving validated full snapshots and errors.
             interval_provider: Callback returning the active sampling interval.
+            on_sample_completed: Optional callback after each sampling attempt.
         """
         self._snapshot_source = snapshot_source
         self._store = store
         self._interval_provider = interval_provider
+        self._on_sample_completed = on_sample_completed
 
         self._wake: asyncio.Event = asyncio.Event()
         self._active: bool = False
@@ -286,6 +289,12 @@ class LoadSampler:
         except Exception as exc:
             self._store.record_error(exc)
             logger.warning("Load reporter sampling failed: %s", exc)
+        finally:
+            if self._on_sample_completed is not None:
+                try:
+                    self._on_sample_completed()
+                except Exception:
+                    logger.exception("Load reporter sample callback failed")
 
     async def _run(self) -> None:
         """Background loop — exactly one task ever calls ``_refresh_once``.

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 # Reporter-internal implementation constants (seconds). Not CLI arguments.
+INITIAL_SAMPLE_TIMEOUT_SECONDS = 1.0
 GRPC_CONNECT_TIMEOUT_SECONDS = 3.0
 GRPC_CLOSE_TIMEOUT_SECONDS = 0.5
 RECONNECT_INITIAL_SECONDS = 0.25

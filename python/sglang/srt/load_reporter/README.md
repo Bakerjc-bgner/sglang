@@ -11,8 +11,11 @@ Worker process.
 Transport direction: the **external Router dials INTO** the Worker's reporter
 port and drives a single bidirectional gRPC stream
 (`LoadMonitorService.Monitor`). The Router sends a `RegisterRequest` first; the
-Worker replies with an ack and its current snapshot and then streams periodic
-`LoadReport` frames on the negotiated interval. This removes the old
+Worker replies with an ack immediately, waits up to one second for the initial
+sampling attempt, and then sends the first `LoadReport`. A successful attempt
+therefore makes the first report a completed current snapshot; a hung attempt
+produces an explicit `UNREACHABLE` report after the bound. Periodic reports are
+then streamed on the negotiated interval, anchored from that first report. This removes the old
 FastAPI-only `POST /v1/start_reporting` control plane, so **every** serving mode
 — including the ones that never start FastAPI — is reachable.
 
@@ -140,7 +143,8 @@ service LoadMonitorService {
   Worker accepts the frame. Invalid input terminates the stream with
   `StreamError(code="INVALID_ARGUMENT")`.
 - `WorkerFrame` = `registered | report | error`. On valid register the Worker
-  sends the ack + current snapshot, then periodic `LoadReport`s.
+  sends the ack immediately, then a bounded sampled-first report, followed by
+  periodic `LoadReport`s.
 - Same `router_id` re-registering on a new stream replaces the old session;
   different `router_id`s coexist. Each session's response queue is capacity-1,
   latest-wins, so a slow Router never accumulates historical reports.

@@ -68,6 +68,32 @@ class HangingSnapshotSource:
         return frozenset({0})
 
 
+class ControlledSnapshotSource:
+    """Return one valid snapshot only after the test releases it."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_loads(self) -> list:
+        from sglang.srt.managers.load_snapshot import LoadSnapshot
+
+        self.started.set()
+        await self.release.wait()
+        return [
+            LoadSnapshot(
+                timestamp=time.time(),
+                dp_rank=0,
+                num_running_reqs=1,
+                max_running_requests=8,
+                max_total_num_tokens=1024,
+            )
+        ]
+
+    def expected_dp_ranks(self) -> frozenset:
+        return frozenset({0})
+
+
 async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> list:
     """Drain up to count non-None items from q within timeout seconds."""
     items = []
@@ -165,6 +191,53 @@ class TestRegisterSession:
             assert len(reports) == 1, "Expected 1 initial report"
         finally:
             session.stop()
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_initial_report_waits_for_first_completed_snapshot(self):
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = ControlledSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, session = rt.register_session("r1", 10_000, 30_000)
+            await asyncio.wait_for(source.started.wait(), timeout=0.5)
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(session.queue.get(), timeout=0.05)
+
+            source.release.set()
+            report = await asyncio.wait_for(session.queue.get(), timeout=0.5)
+
+            assert report.status == pb.REPORT_STATUS_HEALTHY
+            assert [rank.dp_rank for rank in report.ranks] == [0]
+            assert report.ranks[0].num_running_reqs == 1
+        finally:
+            source.release.set()
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_initial_report_is_bounded_when_first_sample_hangs(
+        self, monkeypatch
+    ):
+        import sglang.srt.load_reporter.runtime as runtime_module
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        monkeypatch.setattr(runtime_module, "INITIAL_SAMPLE_TIMEOUT_SECONDS", 0.05)
+        source = ControlledSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        started_at = time.monotonic()
+        try:
+            _, session = rt.register_session("r1", 10_000, 30_000)
+            report = await asyncio.wait_for(session.queue.get(), timeout=0.2)
+
+            assert time.monotonic() - started_at >= 0.04
+            assert report.status == pb.REPORT_STATUS_UNREACHABLE
+            assert not report.ranks
+        finally:
+            source.release.set()
             await rt.close()
 
     @pytest.mark.asyncio

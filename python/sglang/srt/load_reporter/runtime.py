@@ -17,6 +17,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from sglang.srt.load_reporter.config import (
+    INITIAL_SAMPLE_TIMEOUT_SECONDS,
     SHUTDOWN_TIMEOUT_SECONDS,
     LoadReporterConfig,
     WorkerMetadata,
@@ -58,6 +59,7 @@ class _RouterSession:
         identity: WorkerMetadata,
         on_close: Callable[[str, "_RouterSession"], None],
         on_schedule_changed: Callable[[], None],
+        initial_sample_completed: asyncio.Event,
     ) -> None:
         _validate_timing(report_interval_ms, lease_ttl_ms)
         now = time.monotonic()
@@ -71,6 +73,7 @@ class _RouterSession:
         self._identity = identity
         self._on_close = on_close
         self._on_schedule_changed = on_schedule_changed
+        self._initial_sample_completed = initial_sample_completed
 
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         self._done: asyncio.Event = asyncio.Event()
@@ -168,10 +171,51 @@ class _RouterSession:
             report_time_unix_ms=int(time.time() * 1000),
         )
 
+    async def _wait_for_initial_sample(self) -> bool:
+        """Wait for one sampling attempt, bounded by timeout and lease."""
+        deadline = time.monotonic() + INITIAL_SAMPLE_TIMEOUT_SECONDS
+        while True:
+            if self._done.is_set():
+                return False
+
+            now = time.monotonic()
+            if now >= self._lease_expires_at:
+                logger.info("Lease expired for router_id=%s", self._router_id)
+                return False
+            if self._initial_sample_completed.is_set() or now >= deadline:
+                return True
+
+            self._config_changed.clear()
+            if self._done.is_set() or self._initial_sample_completed.is_set():
+                continue
+
+            wait_timeout = max(
+                0.0, min(deadline, self._lease_expires_at) - time.monotonic()
+            )
+            sample_wait = asyncio.create_task(self._initial_sample_completed.wait())
+            config_wait = asyncio.create_task(self._config_changed.wait())
+            try:
+                await asyncio.wait(
+                    (sample_wait, config_wait),
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                sample_wait.cancel()
+                config_wait.cancel()
+                await asyncio.gather(
+                    sample_wait, config_wait, return_exceptions=True
+                )
+
     async def _run(self) -> None:
-        """Background report loop: immediate first report, then periodic."""
+        """Background report loop: sampled first report, then periodic."""
         try:
+            if not await self._wait_for_initial_sample():
+                return
             self._enqueue(self._build_report())
+            self._next_report_deadline = (
+                time.monotonic() + self._report_interval_ms / 1000.0
+            )
 
             while not self._done.is_set():
                 self._config_changed.clear()
@@ -247,6 +291,7 @@ class LoadReporterRuntime:
         self._snapshot_source = snapshot_source
 
         self._store = LatestSnapshotStore()
+        self._initial_sample_completed = asyncio.Event()
         self._builder = ReportBuilder(
             str(uuid.uuid4()),
             self._config.snapshot_stale_after_ms,
@@ -257,6 +302,7 @@ class LoadReporterRuntime:
             snapshot_source,
             self._store,
             interval_provider=self._min_report_interval_ms,
+            on_sample_completed=self._initial_sample_completed.set,
         )
 
     # ------------------------------------------------------------------
@@ -297,6 +343,7 @@ class LoadReporterRuntime:
             identity=self._worker_metadata,
             on_close=self._on_session_closed,
             on_schedule_changed=self._on_schedule_changed,
+            initial_sample_completed=self._initial_sample_completed,
         )
         self._sessions[router_id] = session
         self._on_schedule_changed()
