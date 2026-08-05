@@ -96,6 +96,7 @@ class LoadReporterRefreshNotifier:
         Returns:
             None.
         """
+        self._active = True
         self._task = asyncio.get_running_loop().create_task(self._run())
 
     async def close(self) -> None:
@@ -104,6 +105,7 @@ class LoadReporterRefreshNotifier:
         Returns:
             None.
         """
+        self._active = False
         if self._task is None or self._task.done():
             return
         self._task.cancel()

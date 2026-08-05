@@ -305,7 +305,25 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
-    # Load reporter lifecycle: Phase 4 (Task 4.1) will insert start_load_reporter here.
+    # Embedded load reporter. Single-tokenizer HTTP/native-gRPC own the runtime
+    # and gRPC listener directly; multi-tokenizer HTTP workers forward coalesced
+    # refresh hints to the sole router-owned runtime over IPC (snapshot_source
+    # is None). Returns None (no socket/task) when --load-reporter-port is unset.
+    from sglang.srt.load_reporter import start_load_reporter
+    from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+
+    tokenizer_manager = _global_state.tokenizer_manager
+    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
+        reporter_snapshot_source = ManagerLoadSnapshotSource(
+            tokenizer_manager, range(server_args.dp_size)
+        )
+    else:
+        reporter_snapshot_source = None  # router owns the runtime; worker forwards IPC
+    reporter = await start_load_reporter(
+        server_args,
+        reporter_snapshot_source,
+        event_owner=tokenizer_manager,
+    )
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -430,6 +448,8 @@ async def lifespan(fast_api_app: FastAPI):
                 sidecar.stop()
             except Exception:
                 logger.exception("Failed to stop sidecar")
+        if reporter is not None:
+            await reporter.close()
         _shutdown_native_grpc_server(grpc_handle)
         if tool_server is not None and hasattr(tool_server, "aclose"):
             await tool_server.aclose()

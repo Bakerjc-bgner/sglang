@@ -461,8 +461,10 @@ class MultiTokenizerRouter:
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
-        # Load reporter runtime (lazy-created on first start request in Phase 4)
-        self._load_reporter_runtime: Optional[Any] = None
+        # Sole owner of the load reporter in multi-tokenizer mode: binds the
+        # reporter port on the router loop. HTTP workers only forward coalesced
+        # refresh hints here over IPC. None when --load-reporter-port is unset.
+        self._load_reporter_handle: Optional[Any] = self._start_load_reporter_owner()
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -502,37 +504,51 @@ class MultiTokenizerRouter:
     # Load reporter ownership (router is the sole owner in multi-tokenizer mode)
     # ------------------------------------------------------------------
 
-    def _handle_load_reporter_refresh(self, request: LoadReporterRefreshIpcReq) -> None:
-        """Handle refresh hint from worker.
+    def _start_load_reporter_owner(self) -> Optional[Any]:
+        """Start the router-owned reporter on the router loop (sole port owner).
 
-        If runtime not yet created, log and return (no-op). Otherwise, notify
-        the runtime to trigger a sampler refresh.
+        Reads scheduler load from the router's shared-memory reader. Returns
+        ``None`` when reporting is disabled. Runs the async composition root on
+        ``self._loop`` and blocks until the listener is bound so an occupied
+        fixed port fails router construction explicitly.
         """
-        if self._load_reporter_runtime is None:
-            logger.debug("Received refresh hint but runtime not yet created")
+        if self.server_args.load_reporter_port is None:
+            return None
+
+        from sglang.srt.load_reporter import start_load_reporter
+        from sglang.srt.load_reporter.sampler import RouterLoadSnapshotSource
+
+        source = RouterLoadSnapshotSource(
+            self.load_snapshot_reader, range(self.server_args.dp_size)
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            start_load_reporter(self.server_args, source, event_owner=None),
+            self._loop,
+        )
+        return future.result(timeout=10.0)
+
+    def _handle_load_reporter_refresh(self, request: LoadReporterRefreshIpcReq) -> None:
+        """Forward a worker refresh hint to the router-owned reporter."""
+        if self._load_reporter_handle is None:
             return
-        self._load_reporter_runtime.notify_refresh()
+        self._load_reporter_handle.notify_refresh()
 
     def _update_load_reporter_expected_ranks(self, effective_ep_size: int) -> None:
-        """Update expected_dp_ranks after elastic scale change.
+        """Update expected_dp_ranks after an elastic scale change.
 
-        Called when dp_size changes (elastic scale up/down). If the source
-        reports that ranks changed, notify the runtime to trigger a refresh.
+        Called when dp_size changes (elastic scale up/down); triggers a refresh
+        if the source accepted a changed rank set.
         """
-        if self._load_reporter_runtime is None:
+        if self._load_reporter_handle is None:
             return
-        self._load_reporter_runtime.update_expected_dp_ranks(range(effective_ep_size))
+        self._load_reporter_handle.update_expected_dp_ranks(range(effective_ep_size))
 
     async def _close_load_reporter_owner(self) -> None:
-        """Close the load reporter runtime if it was created.
-
-        Called on the router event loop by the parent shutdown hook. Awaits
-        runtime.close() so all monitors and tasks are cleanly shut down.
-        """
-        runtime = self._load_reporter_runtime
-        if runtime is not None:
-            self._load_reporter_runtime = None
-            await runtime.close()
+        """Close the router-owned reporter handle on the router event loop."""
+        handle = self._load_reporter_handle
+        if handle is not None:
+            self._load_reporter_handle = None
+            await handle.close()
 
     def _close_load_snapshot_reader(self) -> None:
         """Close the Router-owned snapshot reader on the Router event loop.
@@ -632,7 +648,7 @@ class MultiTokenizerRouter:
         Returns:
             None.
         """
-        if self._load_reporter_runtime is None and self.load_snapshot_reader is None:
+        if self._load_reporter_handle is None and self.load_snapshot_reader is None:
             return
         future = asyncio.run_coroutine_threadsafe(
             self._close_router_owned_resources(), self._loop

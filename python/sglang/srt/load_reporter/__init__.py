@@ -2,7 +2,12 @@
 
 from typing import Any, Optional
 
-__all__ = ["LoadReporterRuntime", "describe_optional_dependency_error"]
+__all__ = [
+    "LoadReporterRuntime",
+    "LoadReporterHandle",
+    "start_load_reporter",
+    "describe_optional_dependency_error",
+]
 
 
 def describe_optional_dependency_error(exc: BaseException) -> Optional[str]:
@@ -60,4 +65,10 @@ def __getattr__(name: str) -> Any:
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         return LoadReporterRuntime
+    if name in ("start_load_reporter", "LoadReporterHandle"):
+        # lifecycle imports grpc/protobuf lazily inside start_load_reporter, so
+        # importing this module keeps the disabled path dependency-free.
+        from sglang.srt.load_reporter import lifecycle
+
+        return getattr(lifecycle, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
