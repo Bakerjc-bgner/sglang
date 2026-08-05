@@ -28,6 +28,7 @@ return value or propagates its exception.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import weakref
 from typing import Any, Callable, Optional
@@ -161,26 +162,67 @@ def _make_scheduler_message_decorator(fn: Callable[..., Any]) -> Callable[..., A
     return _scheduler_wrapper
 
 
+async def _finalize_request_lifecycle(owner: Any, make_aiter: Callable[[], Any]):
+    """Shared async-generator finalization for both decorator call styles.
+
+    Iterates the source async generator produced by ``make_aiter`` and fires
+    exactly one ``COMPLETION`` event in the ``finally`` block — covering normal
+    exhaustion, early ``aclose()``, task cancellation, and unhandled
+    exceptions.  A ``None`` binding (disabled or unbound) is a pure passthrough.
+
+    Args:
+        owner: Instance whose bound callback and ``server_args`` gate the event.
+        make_aiter: Zero-arg callable returning the source async iterator.
+
+    Yields:
+        Each item produced by the wrapped async generator, unchanged.
+    """
+    notify = _get_notify(owner)
+    if notify is None:
+        # Pure passthrough — no try/finally overhead.
+        async for item in make_aiter():
+            yield item
+        return
+    from sglang.srt.managers.io_struct import LoadReporterRefreshReason as Reason
+
+    try:
+        async for item in make_aiter():
+            yield item
+    finally:
+        try:
+            notify(Reason.COMPLETION, 1)
+        except Exception:
+            logger.exception("Load monitor callback raised on request_lifecycle")
+
+
 def _make_request_lifecycle_decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap an async generator request method to fire COMPLETION on exit."""
+    """Wrap an async generator to fire COMPLETION on exit.
+
+    Supports both call styles through one finalization helper:
+
+    * unbound function (class-body ``@enable_load_monitor`` on a method) — the
+      owner is the ``self`` passed at call time;
+    * bound method (``enable_load_monitor(...)(instance.generate_request)``) —
+      the owner is captured from ``fn.__self__`` and the wrapper takes no
+      ``self`` (it is installed as an instance attribute, bypassing the
+      descriptor protocol).
+    """
+    # The wrappers are plain functions that RETURN the shared finalization
+    # async generator (one layer, not a nested ``async for``).  This keeps
+    # ``aclose()``/cancellation propagating straight into its ``finally`` so
+    # COMPLETION fires exactly once and promptly.  Callers only ever ``async
+    # for`` / ``__anext__`` the result, never ``await`` the call itself.
+    if inspect.ismethod(fn):
+        owner = fn.__self__
+
+        @functools.wraps(fn)
+        def _bound_wrapper(*args: Any, **kwargs: Any):
+            return _finalize_request_lifecycle(owner, lambda: fn(*args, **kwargs))
+
+        return _bound_wrapper
 
     @functools.wraps(fn)
-    async def _lifecycle_wrapper(self: Any, *args: Any, **kwargs: Any):
-        notify = _get_notify(self)
-        if notify is None:
-            # Pure passthrough — no try/finally overhead
-            async for item in fn(self, *args, **kwargs):
-                yield item
-            return
-        from sglang.srt.managers.io_struct import LoadReporterRefreshReason as Reason
+    def _unbound_wrapper(self: Any, *args: Any, **kwargs: Any):
+        return _finalize_request_lifecycle(self, lambda: fn(self, *args, **kwargs))
 
-        try:
-            async for item in fn(self, *args, **kwargs):
-                yield item
-        finally:
-            try:
-                notify(Reason.COMPLETION, 1)
-            except Exception:
-                logger.exception("Load monitor callback raised on request_lifecycle")
-
-    return _lifecycle_wrapper
+    return _unbound_wrapper

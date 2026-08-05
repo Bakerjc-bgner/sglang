@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Iterable, List, Optional
+from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +42,9 @@ class LoadReporterHandle:
         self._runtime: Optional[Any] = None
         self._server: Optional[Any] = None
         self._notifier: Optional[Any] = None
-        # Reverse-ordered teardown steps registered during startup.  Each entry
-        # is a zero-arg callable returning either ``None`` or an awaitable.
-        self._closers: List[Callable[[], Any]] = []
+        self._unbind: Optional[Callable[[], None]] = None
+        self._restore: Optional[Callable[[], None]] = None
         self._closed = False
-
-    # -- construction helpers (used by start_load_reporter only) -------------
-
-    def _push(self, closer: Callable[[], Any]) -> None:
-        self._closers.append(closer)
 
     # -- delegation surface (multi-tokenizer router) -------------------------
 
@@ -72,18 +66,42 @@ class LoadReporterHandle:
     # -- shutdown ------------------------------------------------------------
 
     async def close(self) -> None:
-        """Idempotent, reverse-order teardown of every acquired resource."""
+        """Idempotent teardown.
+
+        Order: stop accepting Router sessions/reports, stop sampling, close the
+        IPC notifier, then unbind the decorator registry callback and restore
+        any shadowed bound method.  Each step is guarded so a partially started
+        handle (e.g. failed port bind) closes cleanly.
+        """
         if self._closed:
             return
         self._closed = True
-        for closer in reversed(self._closers):
+
+        if self._server is not None:
             try:
-                result = closer()
-                if result is not None and hasattr(result, "__await__"):
-                    await result
+                await self._server.stop(grace=None)
             except Exception:
-                logger.exception("Load reporter shutdown step failed")
-        self._closers.clear()
+                logger.exception("Load reporter gRPC server stop failed")
+        if self._runtime is not None:
+            try:
+                await self._runtime.close()
+            except Exception:
+                logger.exception("Load reporter runtime shutdown failed")
+        if self._notifier is not None:
+            try:
+                await self._notifier.close()
+            except Exception:
+                logger.exception("Load reporter notifier shutdown failed")
+        if self._unbind is not None:
+            try:
+                self._unbind()
+            except Exception:
+                logger.exception("Load reporter unbind failed")
+        if self._restore is not None:
+            try:
+                self._restore()
+            except Exception:
+                logger.exception("Load reporter method restore failed")
 
 
 async def start_load_reporter(
@@ -91,6 +109,7 @@ async def start_load_reporter(
     snapshot_source: Optional[Any],
     *,
     event_owner: Optional[Any] = None,
+    request_lifecycle_method: Optional[str] = None,
 ) -> Optional[LoadReporterHandle]:
     """Start the embedded load reporter for one serving entrypoint.
 
@@ -102,6 +121,10 @@ async def start_load_reporter(
         event_owner: The instance whose decorated ``generate_request`` /
             ``_dispatch_to_scheduler`` should wake the sampler.  ``None`` means
             interval + register-time sampling only.
+        request_lifecycle_method: When set (standalone SMG RPC), the named bound
+            async-generator method on ``event_owner`` is wrapped at runtime with
+            the same ``enable_load_monitor("request_lifecycle")`` decorator and
+            installed on that single instance; restored on ``close()``.
 
     Returns:
         A :class:`LoadReporterHandle` when reporting is enabled, else ``None``.
@@ -111,7 +134,9 @@ async def start_load_reporter(
 
     if snapshot_source is None:
         return await _start_ipc_worker(server_args, event_owner)
-    return await _start_owner(server_args, snapshot_source, event_owner)
+    return await _start_owner(
+        server_args, snapshot_source, event_owner, request_lifecycle_method
+    )
 
 
 async def _start_ipc_worker(
@@ -136,9 +161,7 @@ async def _start_ipc_worker(
     )
     handle._notifier = notifier
     await notifier.start()
-    unbind = bind_load_monitor(event_owner, notifier.notify)
-    handle._push(unbind)
-    handle._push(notifier.close)
+    handle._unbind = bind_load_monitor(event_owner, notifier.notify)
     return handle
 
 
@@ -146,6 +169,7 @@ async def _start_owner(
     server_args: Any,
     snapshot_source: Any,
     event_owner: Optional[Any],
+    request_lifecycle_method: Optional[str],
 ) -> LoadReporterHandle:
     """Single-owner path: own a runtime + gRPC listener on the reporter port."""
     import grpc.aio
@@ -158,7 +182,6 @@ async def _start_owner(
     try:
         runtime = LoadReporterRuntime(snapshot_source, server_args)
         handle._runtime = runtime
-        handle._push(runtime.close)
 
         server = grpc.aio.server()
         add_service_to_server(runtime, server)
@@ -169,14 +192,38 @@ async def _start_owner(
         )
         await server.start()
         handle._server = server
-        handle._push(lambda: server.stop(grace=None))
 
         if event_owner is not None:
-            unbind = bind_load_monitor(
+            handle._unbind = bind_load_monitor(
                 event_owner, lambda reason, count: runtime.notify_refresh()
             )
-            handle._push(unbind)
+        if request_lifecycle_method is not None:
+            _install_lifecycle_shadow(handle, event_owner, request_lifecycle_method)
     except BaseException:
         await handle.close()
         raise
     return handle
+
+
+def _install_lifecycle_shadow(
+    handle: LoadReporterHandle, owner: Any, method_name: str
+) -> None:
+    """Wrap ``owner.<method_name>`` with the request-lifecycle decorator.
+
+    Installs the decorated callable as an instance attribute on this single
+    ``owner`` only — the class method and every other instance are untouched.
+    Registers an identity-safe restore that removes the instance shadow only
+    while it still resolves to this wrapper.
+    """
+    from sglang.srt.load_reporter.decorator import enable_load_monitor
+
+    original = getattr(owner, method_name)
+    decorated = enable_load_monitor("request_lifecycle")(original)
+    setattr(owner, method_name, decorated)
+
+    def _restore() -> None:
+        # Only undo our own shadow; never clobber a later replacement.
+        if owner.__dict__.get(method_name, None) is decorated:
+            del owner.__dict__[method_name]
+
+    handle._restore = _restore

@@ -417,3 +417,156 @@ class TestPortBypass:
         result = dispatch(owner, make_single_dispatch())
         assert result == "ok"
         assert events == []
+
+
+# ---------------------------------------------------------------------------
+# Group 6: request_lifecycle applied to a BOUND method (standalone SMG shape)
+# ---------------------------------------------------------------------------
+
+
+class BoundOwner:
+    """Owner whose async-generator method stays undecorated in the class body;
+    the decorator is applied at runtime to the *bound* method of one instance."""
+
+    def __init__(self, port: Optional[int] = 30100, n: int = 3, fail: bool = False):
+        self.server_args = FakeServerArgs(port=port)
+        self._n = n
+        self._fail = fail
+
+    async def generate_request(self, tag: str = "x"):
+        for i in range(self._n):
+            yield (tag, i)
+            await asyncio.sleep(0)  # realistic suspension point (awaits scheduler)
+        if self._fail:
+            raise ValueError("business error")
+
+
+def _install_bound(owner: BoundOwner):
+    """Apply enable_load_monitor to the bound method and shadow the instance,
+    mirroring the lifecycle installation without importing lifecycle."""
+    from sglang.srt.load_reporter.decorator import enable_load_monitor
+
+    original = owner.generate_request
+    decorated = enable_load_monitor("request_lifecycle")(original)
+    owner.generate_request = decorated
+    return original, decorated
+
+
+class TestBoundRequestLifecycle:
+    @pytest.mark.asyncio
+    async def test_bound_normal_exhaustion_one_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = BoundOwner(n=3)
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        _install_bound(owner)
+
+        collected = [x async for x in owner.generate_request("t")]
+        assert collected == [("t", 0), ("t", 1), ("t", 2)]
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_bound_business_exception_still_one_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = BoundOwner(n=1, fail=True)
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        _install_bound(owner)
+
+        with pytest.raises(ValueError, match="business error"):
+            async for _ in owner.generate_request():
+                pass
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_bound_consumer_aclose_one_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = BoundOwner(n=100)
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        _install_bound(owner)
+
+        gen = owner.generate_request()
+        await gen.__anext__()
+        await gen.aclose()
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_bound_cancellation_one_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = BoundOwner(n=100)
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        _install_bound(owner)
+
+        async def consume():
+            async for _ in owner.generate_request():
+                pass  # only the generator awaits, so cancel lands inside it
+
+        task = asyncio.ensure_future(consume())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_bound_callback_exception_does_not_mask_business(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+
+        owner = BoundOwner(n=1, fail=True)
+        bind_load_monitor(owner, lambda r, c: (_ for _ in ()).throw(RuntimeError("boom")))
+        _install_bound(owner)
+
+        with pytest.raises(ValueError, match="business error"):
+            async for _ in owner.generate_request():
+                pass
+
+    @pytest.mark.asyncio
+    async def test_class_method_unchanged(self):
+        """Shadowing one instance must not alter the class method."""
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+
+        events: list = []
+        owner = BoundOwner(n=2)
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        _install_bound(owner)
+
+        # A second instance resolves the pristine class method (no events).
+        other = BoundOwner(n=2)
+        other_events: list = []
+        bind_load_monitor(other, lambda r, c: other_events.append((r, c)))
+        collected = [x async for x in other.generate_request("o")]
+        assert collected == [("o", 0), ("o", 1)]
+        assert other_events == []  # class method is undecorated
+
+    @pytest.mark.asyncio
+    async def test_wraps_preserves_name_and_wrapped(self):
+        from sglang.srt.load_reporter.decorator import enable_load_monitor
+
+        owner = BoundOwner()
+        original = owner.generate_request
+        decorated = enable_load_monitor("request_lifecycle")(original)
+        assert decorated.__name__ == "generate_request"
+        assert getattr(decorated, "__wrapped__", None) is original
+
+    @pytest.mark.asyncio
+    async def test_bound_disabled_when_port_none(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+
+        events: list = []
+        owner = BoundOwner(port=None, n=2)
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        _install_bound(owner)
+
+        collected = [x async for x in owner.generate_request()]
+        assert collected == [("x", 0), ("x", 1)]
+        assert events == []
