@@ -105,7 +105,7 @@ class LoadReporterLifecycle:
             from sglang.srt.load_reporter import describe_optional_dependency_error
             from sglang.srt.load_reporter.runtime import LoadReporterRuntime
             from sglang.srt.load_reporter.sampler import (
-                TokenizerManagerLoadSnapshotSource,
+                ManagerLoadSnapshotSource,
             )
         except (ModuleNotFoundError, RuntimeError) as exc:
             unsupported_reason = describe_optional_dependency_error(exc)
@@ -118,14 +118,12 @@ class LoadReporterLifecycle:
             )
             return
 
-        snapshot_source = TokenizerManagerLoadSnapshotSource(self._manager)
+        snapshot_source = ManagerLoadSnapshotSource(
+            self._manager, range(self._server_args.dp_size)
+        )
         self._runtime = LoadReporterRuntime(
             snapshot_source,
             self._server_args,
-            active_changed=lambda active: logger.info(
-                "Load reporter active=%s",
-                active,
-            ),
         )
         from sglang.srt.load_reporter.decorator import bind_load_monitor
         self._unbind = bind_load_monitor(

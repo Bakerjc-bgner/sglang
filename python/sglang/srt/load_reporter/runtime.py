@@ -1,32 +1,28 @@
 """Top-level assembly of the embedded load reporter.
 
 ``LoadReporterRuntime`` is the composition root: it constructs the store,
-builder, sampler, and monitor manager, wires them into one asyncio event loop,
-and exposes the seams the HTTP layer uses -- ``start_reporting`` (control
-plane), ``notify_refresh`` / ``notify_request_finished`` /
+builder, sampler, and session table, wires them into one asyncio event loop,
+and exposes the seams the serving layer uses: ``register_session`` (inbound
+Router sessions), ``notify_refresh`` / ``notify_request_finished`` /
 ``notify_source_changed`` (data-plane refresh), and ``close``
-(bounded shutdown). Nothing here computes load metrics; it only orders the
-collaborators.
+(bounded shutdown). Nothing here computes load metrics.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from sglang.srt.load_reporter.config import (
     SHUTDOWN_TIMEOUT_SECONDS,
     LoadReporterConfig,
     WorkerMetadata,
 )
-from sglang.srt.load_reporter.monitor import MonitorManager, MonitorTask
-from sglang.srt.load_reporter.registration import (
-    RuntimeClosingError,
-    StartReportingRequest,
-    StartReportingResponse,
-)
+from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+from sglang.srt.load_reporter.registration import WorkerIdentity
 from sglang.srt.load_reporter.report_builder import ReportBuilder, SequenceAllocator
 from sglang.srt.load_reporter.sampler import LoadSampler
 from sglang.srt.load_reporter.store import LatestSnapshotStore
@@ -34,31 +30,186 @@ from sglang.srt.load_reporter.store import LatestSnapshotStore
 logger = logging.getLogger(__name__)
 
 
+class _RouterSession:
+    """Per-Router-ID inbound bidi-stream session.
+
+    Owns one ``asyncio.Queue(maxsize=1)`` response queue (latest-wins) and a
+    background report loop. A ``None`` sentinel is placed in the queue when the
+    session ends so the service write loop exits cleanly.
+    """
+
+    def __init__(
+        self,
+        router_id: str,
+        report_interval_ms: int,
+        lease_ttl_ms: int,
+        store: LatestSnapshotStore,
+        builder: ReportBuilder,
+        identity: WorkerIdentity,
+        on_close: Any,
+    ) -> None:
+        self._router_id = router_id
+        self._report_interval_ms = report_interval_ms
+        self._lease_ttl_ms = lease_ttl_ms
+        self._lease_expires_at: float = time.monotonic() + lease_ttl_ms / 1000.0
+        self._store = store
+        self._builder = builder
+        self._identity = identity
+        self._on_close = on_close
+
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._done: asyncio.Event = asyncio.Event()
+        self._task: asyncio.Task = asyncio.create_task(
+            self._run(), name=f"lr-session-{router_id}"
+        )
+
+    # ------------------------------------------------------------------
+    # Public interface used by service.py
+    # ------------------------------------------------------------------
+
+    @property
+    def queue(self) -> asyncio.Queue:
+        """Response queue; contains LoadReport or None (session ended)."""
+        return self._queue
+
+    @property
+    def report_interval_ms(self) -> int:
+        """Current report cadence for this session."""
+        return self._report_interval_ms
+
+    def refresh_lease(self) -> None:
+        """Reset lease timer to now + current lease_ttl_ms."""
+        self._lease_expires_at = time.monotonic() + self._lease_ttl_ms / 1000.0
+
+    def update_config(
+        self,
+        report_interval_ms: Optional[int] = None,
+        lease_ttl_ms: Optional[int] = None,
+    ) -> None:
+        """Live-update interval and/or lease; also refreshes the lease."""
+        if report_interval_ms is not None:
+            self._report_interval_ms = report_interval_ms
+        if lease_ttl_ms is not None:
+            self._lease_ttl_ms = lease_ttl_ms
+        self.refresh_lease()
+
+    def stop(self) -> None:
+        """Idempotent stop: signal the report loop to exit."""
+        self._done.set()
+
+    def cancel(self) -> None:
+        """Hard-cancel the report task without triggering on_close.
+
+        Used by the runtime's timeout shutdown path to avoid the replaced
+        session being deleted from the table by a stale on_close callback.
+        """
+        self._on_close = lambda _rid: None  # defuse callback before cancel
+        self._task.cancel()
+
+    async def wait_stopped(self) -> None:
+        """Await the report loop task (used during shutdown)."""
+        try:
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # ------------------------------------------------------------------
+    # Internal report loop
+    # ------------------------------------------------------------------
+
+    def _enqueue(self, item: Any) -> None:
+        """Latest-wins enqueue: drop old item if queue is full."""
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            pass  # consumed between check and put — skip
+
+    def _build_report(self) -> pb.LoadReport:
+        """Build a report from the current snapshot store view."""
+        view = self._store.view()
+        return self._builder.build(
+            view,
+            self._identity,
+            report_time_unix_ms=int(time.time() * 1000),
+        )
+
+    async def _run(self) -> None:
+        """Background report loop: immediate first report, then periodic."""
+        try:
+            self._enqueue(self._build_report())
+
+            while not self._done.is_set():
+                interval_sec = self._report_interval_ms / 1000.0
+                time_to_lease = max(0.0, self._lease_expires_at - time.monotonic())
+                sleep_sec = min(interval_sec, time_to_lease)
+
+                try:
+                    await asyncio.wait_for(self._done.wait(), timeout=sleep_sec)
+                    break  # done event fired
+                except asyncio.TimeoutError:
+                    pass
+
+                if time.monotonic() >= self._lease_expires_at:
+                    logger.info("Lease expired for router_id=%s", self._router_id)
+                    break
+
+                self._enqueue(self._build_report())
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "Session report loop error for router_id=%s", self._router_id
+            )
+        finally:
+            self._enqueue(None)  # sentinel: write loop exits
+            self._done.set()
+            try:
+                self._on_close(self._router_id, self)
+            except Exception:
+                logger.exception("on_close callback failed for router_id=%s", self._router_id)
+
+
 class LoadReporterRuntime:
-    """Owns the reporter collaborators for a single-tokenizer HTTP process."""
+    """Owns the reporter collaborators for any serving mode.
+
+    Manages inbound Router sessions.  The snapshot source may be any object
+    satisfying ``LoadSnapshotSource`` -- no FastAPI, TokenizerManager, or
+    GrpcRequestManager imports here.
+    """
 
     def __init__(
         self,
         snapshot_source: Any,
         server_args: Any,
-        *,
-        active_changed: Optional[Callable[[bool], None]] = None,
     ) -> None:
         """Assemble reporter collaborators around one snapshot source.
 
         Args:
             snapshot_source: Adapter providing load snapshots and expected ranks.
             server_args: SGLang server configuration.
-            active_changed: Optional callback for zero-to-one monitor transitions.
         """
         self._closing = False
         self._config = LoadReporterConfig.from_server_args(server_args)
         self._worker_metadata = WorkerMetadata.from_server_args(server_args)
-        self._active_changed: Callable[[bool], None] = (
-            active_changed if active_changed is not None else lambda _active: None
-        )
-        self._last_active = False
         self._snapshot_source = snapshot_source
+
+        # Process-constant worker identity (Router dials in; we self-report).
+        worker_addr = f"{server_args.host}:{server_args.load_reporter_port}"
+        self._identity = WorkerIdentity(
+            worker_addr=worker_addr,
+            worker_type=self._worker_metadata.worker_type,
+            model=self._worker_metadata.model,
+            zone=self._worker_metadata.zone,
+        )
 
         self._store = LatestSnapshotStore()
         self._builder = ReportBuilder(
@@ -66,81 +217,86 @@ class LoadReporterRuntime:
             self._config.snapshot_stale_after_ms,
             SequenceAllocator(),
         )
+        self._sessions: Dict[str, _RouterSession] = {}
         self._sampler = LoadSampler(
             snapshot_source,
             self._store,
-            interval_provider=lambda: self._manager.min_report_interval_ms,
-        )
-        self._manager = MonitorManager(
-            factory=self._new_monitor,
-            schedule_changed=self._on_schedule_changed,
-            worker_metadata=self._worker_metadata,
+            interval_provider=self._min_report_interval_ms,
         )
 
     # ------------------------------------------------------------------
-    # Collaborator wiring
+    # Session management (inbound Router streams)
     # ------------------------------------------------------------------
 
-    def _on_schedule_changed(self) -> None:
-        """Synchronize sampler activation with the live monitor schedule.
+    def register_session(
+        self,
+        router_id: str,
+        report_interval_ms: int,
+        lease_ttl_ms: int,
+    ) -> Tuple[pb.RegisterResponse, "_RouterSession"]:
+        """Register or replace the session for router_id.
+
+        Same router_id re-registering (new stream) stops the old session and
+        installs the new one. Different router_ids coexist.
 
         Returns:
-            None.
-        """
-        active = self._manager.monitor_count > 0
-        if active and not self._last_active:
-            self._sampler.activate()
-        elif active:
-            self._sampler.notify_schedule_changed()
-        elif self._last_active:
-            self._sampler.deactivate()
-
-        if active != self._last_active:
-            self._last_active = active
-            self._active_changed(active)
-
-    def _new_monitor(self, registration, generation, on_stopped) -> MonitorTask:
-        """Construct one generation-owned monitor task.
-
-        Args:
-            registration: Immutable target registration.
-            generation: Manager-assigned ownership generation.
-            on_stopped: Callback invoked when the monitor exits.
-
-        Returns:
-            A configured MonitorTask.
-        """
-        return MonitorTask(
-            registration,
-            self._store,
-            self._builder,
-            on_stopped,
-            generation=generation,
-        )
-
-    # ------------------------------------------------------------------
-    # Control plane / request-end seams
-    # ------------------------------------------------------------------
-
-    async def start_reporting(
-        self, payload: StartReportingRequest, worker_addr: str
-    ) -> StartReportingResponse:
-        """Register or renew one Router target and activate sampling.
-
-        Args:
-            payload: Validated reporting interval, lease, and Router target.
-            worker_addr: Canonical address identifying this worker.
-
-        Returns:
-            The accepted lease and renewal timing.
-
-        Raises:
-            RuntimeClosingError: If shutdown has already started.
-            WorkerIdentityConflict: If another worker owns the live target.
+            ``(RegisterResponse, session)`` — yield the ack, then drain the queue.
         """
         if self._closing:
-            raise RuntimeClosingError("load reporter is shutting down")
-        return await self._manager.upsert(payload, worker_addr)
+            raise RuntimeError("load reporter is shutting down")
+
+        # Replace any existing session for this router_id.
+        old = self._sessions.pop(router_id, None)
+        if old is not None:
+            old.stop()
+
+        session = _RouterSession(
+            router_id=router_id,
+            report_interval_ms=report_interval_ms,
+            lease_ttl_ms=lease_ttl_ms,
+            store=self._store,
+            builder=self._builder,
+            identity=self._identity,
+            on_close=self._on_session_closed,
+        )
+        self._sessions[router_id] = session
+        self._on_schedule_changed()
+
+        renew_after_ms = max(1, lease_ttl_ms // 3)
+        ack = pb.RegisterResponse(
+            lease_ttl_ms=lease_ttl_ms,
+            renew_after_ms=renew_after_ms,
+        )
+        return ack, session
+
+    def _on_session_closed(self, router_id: str, session: "_RouterSession") -> None:
+        """Remove session from table only if it still owns the slot (C1 fix).
+
+        The old session's cleanup must not delete the new session when
+        same-router_id replacement occurs: we check identity before popping.
+        """
+        if self._sessions.get(router_id) is session:
+            del self._sessions[router_id]
+            self._on_schedule_changed()
+
+    def _min_report_interval_ms(self) -> Optional[int]:
+        """Minimum interval across active sessions; None when no sessions."""
+        if not self._sessions:
+            return None
+        return min(s.report_interval_ms for s in self._sessions.values())
+
+    def _on_schedule_changed(self) -> None:
+        """Activate or deactivate the sampler based on session count."""
+        active = bool(self._sessions)
+        if active:
+            self._sampler.activate()
+            self._sampler.notify_schedule_changed()
+        else:
+            self._sampler.deactivate()
+
+    # ------------------------------------------------------------------
+    # Request-end / decorator seams (wake sampler only)
+    # ------------------------------------------------------------------
 
     def notify_refresh(self) -> None:
         """Synchronous, non-throwing refresh signal."""
@@ -164,12 +320,8 @@ class LoadReporterRuntime:
     def update_expected_dp_ranks(self, expected_dp_ranks: Iterable[int]) -> bool:
         """Update a rank-aware snapshot source after elastic scaling.
 
-        Args:
-            expected_dp_ranks: DP ranks expected in the next aggregate snapshot.
-
         Returns:
-            ``True`` when the source accepted a changed rank set; otherwise
-            ``False`` for unchanged or non-rank-aware sources.
+            ``True`` when the source accepted a changed rank set.
         """
         update = getattr(self._snapshot_source, "update_expected_dp_ranks", None)
         if update is None or not update(expected_dp_ranks):
@@ -182,24 +334,35 @@ class LoadReporterRuntime:
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Bounded, idempotent shutdown. Never constructs a final report."""
+        """Bounded, idempotent shutdown."""
         if self._closing:
             return
         self._closing = True
 
-        async def close_in_order() -> None:
-            """Stop sampling before closing all monitor streams."""
+        async def close_all() -> None:
             await self._sampler.close()
-            await self._manager.close()
+            sessions = list(self._sessions.values())
+            for s in sessions:
+                s.stop()
+            for s in sessions:
+                await s.wait_stopped()
 
         try:
-            await asyncio.wait_for(close_in_order(), SHUTDOWN_TIMEOUT_SECONDS)
+            await asyncio.wait_for(close_all(), SHUTDOWN_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             logger.warning(
                 "Load reporter shutdown exceeded %.1fs; cancelling remaining tasks",
                 SHUTDOWN_TIMEOUT_SECONDS,
             )
             await self._sampler.close()
-            await self._manager.cancel_remaining()
+            # Hard-cancel any sessions that failed to converge.  cancel()
+            # defuses the on_close callback so it cannot corrupt the table.
+            remaining = list(self._sessions.values())
+            for s in remaining:
+                s.cancel()
+            if remaining:
+                await asyncio.gather(
+                    *(s._task for s in remaining), return_exceptions=True
+                )
         except Exception:
             logger.exception("Load reporter shutdown failed")

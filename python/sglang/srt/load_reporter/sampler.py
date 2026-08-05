@@ -48,24 +48,31 @@ class LoadSnapshotSource(Protocol):
         raise NotImplementedError
 
 
-class TokenizerManagerLoadSnapshotSource:
-    """Adapts a ``TokenizerManager`` to the ``LoadSnapshotSource`` protocol."""
+class ManagerLoadSnapshotSource:
+    """Adapts a manager to the ``LoadSnapshotSource`` protocol.
 
-    def __init__(self, tokenizer_manager: Any) -> None:
-        """Wrap one TokenizerManager as a snapshot source.
+    The expected DP rank set is immutable, captured at construction.
+    Used for both TokenizerManager (single-tokenizer) and future
+    GrpcRequestManager (standalone SMG RPC).
+    """
+
+    def __init__(self, manager: Any, expected_dp_ranks: Collection[int]) -> None:
+        """Wrap a manager with an immutable authoritative rank set.
 
         Args:
-            tokenizer_manager: Manager exposing get_loads and elastic worker count.
+            manager: Manager exposing get_loads(include=["core"]).
+            expected_dp_ranks: DP ranks required for a full snapshot.
         """
-        self._manager = tokenizer_manager
+        self._manager = manager
+        self._expected: frozenset[int] = frozenset(expected_dp_ranks)
 
     async def get_loads(self) -> list:
         """Fetch core load snapshots from the wrapped manager."""
         return await self._manager.get_loads(include=["core"])
 
     def expected_dp_ranks(self) -> frozenset[int]:
-        """Return all DP ranks currently owned by the manager."""
-        return frozenset(range(self._manager.elastic_worker_count))
+        """Return the immutable authoritative DP rank set."""
+        return self._expected
 
 
 class RouterLoadSnapshotSource:
