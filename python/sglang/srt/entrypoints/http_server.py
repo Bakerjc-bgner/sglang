@@ -265,18 +265,9 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    """Initialize and tear down HTTP worker resources for one app process.
-
-    Args:
-        fast_api_app: FastAPI application whose state receives runtime services.
-
-    Yields:
-        Control to FastAPI while all per-process services are active.
-    """
     grpc_handle = None
     sidecar = None
     warmup_thread = None
-    reporter = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -304,26 +295,6 @@ async def lifespan(fast_api_app: FastAPI):
         elif server_args.disaggregation_mode == "decode":
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
-
-    # Embedded load reporter. Single-tokenizer HTTP/native-gRPC own the runtime
-    # and gRPC listener directly; multi-tokenizer HTTP workers forward coalesced
-    # refresh hints to the sole router-owned runtime over IPC (snapshot_source
-    # is None). Returns None (no socket/task) when --load-reporter-port is unset.
-    from sglang.srt.load_reporter import start_load_reporter
-    from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
-
-    tokenizer_manager = _global_state.tokenizer_manager
-    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
-        reporter_snapshot_source = ManagerLoadSnapshotSource(
-            tokenizer_manager, range(server_args.dp_size)
-        )
-    else:
-        reporter_snapshot_source = None  # router owns the runtime; worker forwards IPC
-    reporter = await start_load_reporter(
-        server_args,
-        reporter_snapshot_source,
-        event_owner=tokenizer_manager,
-    )
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -412,49 +383,49 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Start the native gRPC server and warmup inside the try so a failure in
-    # either still runs the finally cleanup below. Native gRPC is enabled via
-    # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
-    # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
-    try:
-        if (
-            getattr(fast_api_app, "is_single_tokenizer_mode", False)
-            and server_args.grpc_port is not None
-            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
-        ):
-            grpc_handle = _start_native_grpc_server_for_runtime(
-                server_args=server_args,
-                tokenizer_manager=_global_state.tokenizer_manager,
-                template_manager=_global_state.template_manager,
-                scheduler_info=_global_state.scheduler_info,
+    from sglang.srt.load_reporter.lifecycle import http_load_reporter_lifespan
+
+    single_tokenizer = getattr(fast_api_app, "is_single_tokenizer_mode", False)
+    async with http_load_reporter_lifespan(
+        server_args,
+        _global_state.tokenizer_manager,
+        single_tokenizer=single_tokenizer,
+    ):
+        try:
+            if (
+                single_tokenizer
+                and server_args.grpc_port is not None
+                and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+            ):
+                grpc_handle = _start_native_grpc_server_for_runtime(
+                    server_args=server_args,
+                    tokenizer_manager=_global_state.tokenizer_manager,
+                    template_manager=_global_state.template_manager,
+                    scheduler_info=_global_state.scheduler_info,
+                )
+                if server_args.sidecar is not None:
+                    from sglang.srt.entrypoints.sidecar import start_sidecar
+
+                    sidecar = start_sidecar(server_args)
+
+            warmup_thread = threading.Thread(
+                target=_wait_and_warmup,
+                kwargs=warmup_thread_kwargs,
             )
-            if server_args.sidecar is not None:
-                from sglang.srt.entrypoints.sidecar import start_sidecar
+            warmup_thread.start()
 
-                sidecar = start_sidecar(server_args)
-
-        # Execute the general warmup
-        warmup_thread = threading.Thread(
-            target=_wait_and_warmup,
-            kwargs=warmup_thread_kwargs,
-        )
-        warmup_thread.start()
-
-        # Start the HTTP server
-        yield
-    finally:
-        if sidecar is not None:
-            try:
-                sidecar.stop()
-            except Exception:
-                logger.exception("Failed to stop sidecar")
-        if reporter is not None:
-            await reporter.close()
-        _shutdown_native_grpc_server(grpc_handle)
-        if tool_server is not None and hasattr(tool_server, "aclose"):
-            await tool_server.aclose()
-        if warmup_thread is not None:
-            warmup_thread.join()
+            yield
+        finally:
+            if sidecar is not None:
+                try:
+                    sidecar.stop()
+                except Exception:
+                    logger.exception("Failed to stop sidecar")
+            _shutdown_native_grpc_server(grpc_handle)
+            if tool_server is not None and hasattr(tool_server, "aclose"):
+                await tool_server.aclose()
+            if warmup_thread is not None:
+                warmup_thread.join()
 
 
 # Fast API

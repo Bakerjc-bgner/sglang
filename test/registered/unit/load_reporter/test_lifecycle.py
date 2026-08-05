@@ -376,6 +376,31 @@ class TestBackgroundOwnerPath:
             reporter.close()
 
 
+class TestHttpLifecycleAdapter:
+    @pytest.mark.asyncio
+    async def test_failure_inside_lifespan_releases_reporter_port(self):
+        from sglang.srt.load_reporter.lifecycle import http_load_reporter_lifespan
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        owner = FakeOwner(port=port)
+        args = make_server_args(port=port)
+        with pytest.raises(RuntimeError, match="startup failed"):
+            async with http_load_reporter_lifespan(
+                args, owner, single_tokenizer=True
+            ):
+                raise RuntimeError("startup failed")
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", port))
+        finally:
+            probe.close()
+
+
 # ---------------------------------------------------------------------------
 # Group 3: IPC-worker path — multi-tokenizer HTTP worker
 # ---------------------------------------------------------------------------

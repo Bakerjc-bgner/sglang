@@ -27,6 +27,8 @@ import concurrent.futures
 import logging
 import os
 import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
@@ -253,6 +255,38 @@ async def start_load_reporter(
     return await _start_owner(
         server_args, snapshot_source, event_owner, request_lifecycle_method
     )
+
+
+@asynccontextmanager
+async def http_load_reporter_lifespan(
+    server_args: Any,
+    event_owner: Any,
+    *,
+    single_tokenizer: bool,
+) -> AsyncIterator[None]:
+    """Own HTTP reporter startup and cleanup behind one lifecycle seam."""
+    if getattr(server_args, "load_reporter_port", None) is None:
+        yield
+        return
+
+    snapshot_source = None
+    if single_tokenizer:
+        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+
+        snapshot_source = ManagerLoadSnapshotSource(
+            event_owner, range(server_args.dp_size)
+        )
+
+    handle = await start_load_reporter(
+        server_args,
+        snapshot_source,
+        event_owner=event_owner,
+    )
+    try:
+        yield
+    finally:
+        if handle is not None:
+            await handle.close()
 
 
 async def _start_ipc_worker(
