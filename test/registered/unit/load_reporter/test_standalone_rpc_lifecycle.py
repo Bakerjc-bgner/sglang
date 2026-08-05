@@ -36,7 +36,9 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 # ---------------------------------------------------------------------------
 
 
-def make_server_args(*, port: Optional[int], sidecar_port: int) -> types.SimpleNamespace:
+def make_server_args(
+    *, port: Optional[int], sidecar_port: int
+) -> types.SimpleNamespace:
     args = types.SimpleNamespace()
     args.host = "127.0.0.1"
     args.port = sidecar_port - 1
@@ -99,7 +101,9 @@ def install_fake_smg(capability: bool):
 
     if capability:
 
-        async def fake_serve_grpc(server_args, model_info, on_request_manager_ready=None):
+        async def fake_serve_grpc(
+            server_args, model_info, on_request_manager_ready=None
+        ):
             rm = FakeRequestManager(server_args)
             holder.request_manager = rm
             if on_request_manager_ready is not None:

@@ -127,14 +127,18 @@ def _classify_scheduler_obj(obj: Any) -> Optional[tuple[Any, int]]:
         AbortReq,
         BatchTokenizedEmbeddingReqInput,
         BatchTokenizedGenerateReqInput,
+    )
+    from sglang.srt.managers.io_struct import LoadReporterRefreshReason as Reason
+    from sglang.srt.managers.io_struct import (
         TokenizedEmbeddingReqInput,
         TokenizedGenerateReqInput,
     )
-    from sglang.srt.managers.io_struct import LoadReporterRefreshReason as Reason
 
     if isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
         return (Reason.DISPATCH, 1)
-    if isinstance(obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)):
+    if isinstance(
+        obj, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+    ):
         return (Reason.DISPATCH, len(obj.batch))
     if isinstance(obj, AbortReq):
         return (Reason.ABORT, 1)

@@ -187,9 +187,7 @@ async def _start_owner(
         add_service_to_server(runtime, server)
         # Explicit bind: grpc.aio raises RuntimeError on failure (never a
         # silent random-port fallback), which we surface after cleanup.
-        server.add_insecure_port(
-            f"{server_args.host}:{server_args.load_reporter_port}"
-        )
+        server.add_insecure_port(f"{server_args.host}:{server_args.load_reporter_port}")
         await server.start()
         handle._server = server
 

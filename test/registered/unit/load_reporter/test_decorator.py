@@ -108,7 +108,9 @@ def make_single_dispatch():
 def make_batch_dispatch(n: int = 3):
     from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput
 
-    return BatchTokenizedGenerateReqInput(batch=[_make_minimal_single() for _ in range(n)])
+    return BatchTokenizedGenerateReqInput(
+        batch=[_make_minimal_single() for _ in range(n)]
+    )
 
 
 def make_abort():
@@ -157,7 +159,10 @@ class TestNoBinding:
 
 class TestMultipleOwners:
     def test_two_owners_independent_callbacks(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
 
         events_a: list = []
         events_b: list = []
@@ -216,7 +221,10 @@ class TestMultipleOwners:
 
 class TestSchedulerMessageClassification:
     def _run(self, payload, port=30100):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
 
         events: list = []
         owner = FakeOwner(port=port)
@@ -253,7 +261,10 @@ class TestSchedulerMessageClassification:
         assert events == []
 
     def test_no_event_on_sync_exception(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
 
         events: list = []
         owner = FakeOwner()
@@ -276,7 +287,10 @@ class TestSchedulerMessageClassification:
 class TestRequestLifecycle:
     @pytest.mark.asyncio
     async def test_normal_exhaustion_emits_one_completion(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
         from sglang.srt.managers.io_struct import LoadReporterRefreshReason
 
         events: list = []
@@ -294,7 +308,10 @@ class TestRequestLifecycle:
 
     @pytest.mark.asyncio
     async def test_business_exception_still_emits_completion(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
         from sglang.srt.managers.io_struct import LoadReporterRefreshReason
 
         events: list = []
@@ -314,7 +331,10 @@ class TestRequestLifecycle:
 
     @pytest.mark.asyncio
     async def test_consumer_aclose_emits_completion(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
         from sglang.srt.managers.io_struct import LoadReporterRefreshReason
 
         events: list = []
@@ -334,7 +354,10 @@ class TestRequestLifecycle:
 
     @pytest.mark.asyncio
     async def test_task_cancel_emits_completion(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
         from sglang.srt.managers.io_struct import LoadReporterRefreshReason
 
         events: list = []
@@ -362,7 +385,10 @@ class TestRequestLifecycle:
 
     @pytest.mark.asyncio
     async def test_callback_exception_does_not_mask_business_exception(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
 
         owner = FakeOwner()
 
@@ -381,7 +407,10 @@ class TestRequestLifecycle:
 
     @pytest.mark.asyncio
     async def test_completion_not_fired_when_port_is_none(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
 
         events: list = []
         owner = FakeOwner(port=None)  # reporter disabled
@@ -404,7 +433,10 @@ class TestRequestLifecycle:
 
 class TestPortBypass:
     def test_sync_no_callback_when_port_none(self):
-        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
 
         events: list = []
         owner = FakeOwner(port=None)
@@ -523,7 +555,9 @@ class TestBoundRequestLifecycle:
         from sglang.srt.load_reporter.decorator import bind_load_monitor
 
         owner = BoundOwner(n=1, fail=True)
-        bind_load_monitor(owner, lambda r, c: (_ for _ in ()).throw(RuntimeError("boom")))
+        bind_load_monitor(
+            owner, lambda r, c: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
         _install_bound(owner)
 
         with pytest.raises(ValueError, match="business error"):

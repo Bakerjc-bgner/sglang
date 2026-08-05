@@ -154,8 +154,7 @@ class TestDisabled:
         import sys
         import textwrap
 
-        code = textwrap.dedent(
-            """
+        code = textwrap.dedent("""
             import asyncio, sys, types
             from sglang.srt.load_reporter.lifecycle import start_load_reporter
 
@@ -172,8 +171,7 @@ class TestDisabled:
             bad = [m for m in sys.modules if m == "grpc" or m.startswith("grpc.")]
             assert not bad, f"grpc imported while disabled: {bad}"
             print("OK")
-            """
-        )
+            """)
         result = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
@@ -297,9 +295,7 @@ class TestIpcWorkerPath:
 
         owner = FakeWorkerOwner(port=40404)
         generate = owner.make_generate()
-        handle = await start_load_reporter(
-            owner.server_args, None, event_owner=owner
-        )
+        handle = await start_load_reporter(owner.server_args, None, event_owner=owner)
         assert handle is not None
         try:
             # No listener should be bound on the worker path.
@@ -405,9 +401,7 @@ class TestHandleDelegation:
         from sglang.srt.load_reporter.lifecycle import start_load_reporter
 
         owner = FakeWorkerOwner(port=40405)
-        handle = await start_load_reporter(
-            owner.server_args, None, event_owner=owner
-        )
+        handle = await start_load_reporter(owner.server_args, None, event_owner=owner)
         assert handle is not None
         try:
             handle.notify_refresh()  # must be a safe no-op
