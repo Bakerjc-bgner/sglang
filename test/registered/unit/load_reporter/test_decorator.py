@@ -1,0 +1,419 @@
+"""Contract tests for the load monitor decorator seam.
+
+All observations go through public API only:
+  - enable_load_monitor / bind_load_monitor
+  - business return values and exceptions from decorated functions
+  - callback invocation results
+
+No registry introspection, no test-only getters, no production state added.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import weakref
+from typing import Any, Optional
+
+import pytest
+
+pytest_plugins = ("pytest_asyncio",)
+
+
+# ---------------------------------------------------------------------------
+# Minimal stand-ins (live only in test/)
+# ---------------------------------------------------------------------------
+
+
+class FakeServerArgs:
+    """Minimal ServerArgs stand-in."""
+
+    def __init__(self, port: Optional[int] = 30100):
+        self.load_reporter_port = port
+
+
+class FakeOwner:
+    """Minimal owner that has server_args, mimicking TokenizerManager."""
+
+    def __init__(self, port: Optional[int] = 30100):
+        self.server_args = FakeServerArgs(port=port)
+
+    @staticmethod
+    def make_sync(port: Optional[int] = 30100) -> "FakeOwner":
+        return FakeOwner(port=port)
+
+
+# ---------------------------------------------------------------------------
+# Helpers to build decorated functions on FakeOwner
+# ---------------------------------------------------------------------------
+
+
+def make_sync_fn(owner: FakeOwner, payload_factory=None):
+    """Return a synchronous scheduler-like method bound to *owner*."""
+    from sglang.srt.load_reporter.decorator import enable_load_monitor
+
+    @enable_load_monitor("scheduler_message")
+    def dispatch(self, obj: Any) -> str:
+        return "dispatched"
+
+    return lambda obj: dispatch(owner, obj)
+
+
+def make_async_gen(owner: FakeOwner, items=(1, 2, 3)):
+    """Return an async-generator method bound to *owner* that yields *items*."""
+    from sglang.srt.load_reporter.decorator import enable_load_monitor
+
+    @enable_load_monitor("request_lifecycle")
+    async def generate(self):
+        for item in items:
+            yield item
+
+    async def call():
+        async for item in generate(owner):
+            yield item
+
+    return call
+
+
+# ---------------------------------------------------------------------------
+# Fixture payloads
+# ---------------------------------------------------------------------------
+
+
+def _make_minimal_single():
+    """Create a minimal but real TokenizedGenerateReqInput."""
+    from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    return TokenizedGenerateReqInput(
+        input_text=None,
+        input_ids=None,
+        input_embeds=None,
+        mm_inputs=None,
+        token_type_ids=None,
+        sampling_params=SamplingParams(),
+        return_logprob=False,
+        logprob_start_len=0,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        stream=False,
+        return_sampling_mask=False,
+    )
+
+
+def make_single_dispatch():
+    return _make_minimal_single()
+
+
+def make_batch_dispatch(n: int = 3):
+    from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput
+
+    return BatchTokenizedGenerateReqInput(batch=[_make_minimal_single() for _ in range(n)])
+
+
+def make_abort():
+    from sglang.srt.managers.io_struct import AbortReq
+
+    return AbortReq(rid="r1", abort_all=False)
+
+
+# ---------------------------------------------------------------------------
+# Group 1: no binding — passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestNoBinding:
+    def test_sync_returns_without_callback(self):
+        owner = FakeOwner()
+        dispatch = make_sync_fn(owner)
+        result = dispatch(make_single_dispatch())
+        assert result == "dispatched"
+
+    @pytest.mark.asyncio
+    async def test_async_gen_yields_all_items(self):
+        owner = FakeOwner()
+        items = list(range(5))
+        call = make_async_gen(owner, items)
+        collected = [x async for x in call()]
+        assert collected == items
+
+    def test_sync_no_grpc_import_when_no_binding(self, monkeypatch):
+        """Ensure grpc/protobuf are not imported via decorator when unbound."""
+        import sys
+
+        owner = FakeOwner()
+        dispatch = make_sync_fn(owner)
+        before = set(sys.modules.keys())
+        dispatch(make_single_dispatch())
+        after = set(sys.modules.keys())
+        new_mods = after - before
+        assert not any("grpc" in m or "protobuf" in m for m in new_mods)
+
+
+# ---------------------------------------------------------------------------
+# Group 2: two owners, independent callbacks
+# ---------------------------------------------------------------------------
+
+
+class TestMultipleOwners:
+    def test_two_owners_independent_callbacks(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+
+        events_a: list = []
+        events_b: list = []
+
+        @enable_load_monitor("scheduler_message")
+        def dispatch(self, obj: Any) -> None:
+            pass
+
+        owner_a = FakeOwner()
+        owner_b = FakeOwner()
+        unbind_a = bind_load_monitor(owner_a, lambda r, c: events_a.append((r, c)))
+        bind_load_monitor(owner_b, lambda r, c: events_b.append((r, c)))
+
+        payload = make_single_dispatch()
+        dispatch(owner_a, payload)
+        dispatch(owner_b, payload)
+
+        assert len(events_a) == 1
+        assert len(events_b) == 1
+
+        # Unbind a — b still fires
+        unbind_a()
+        dispatch(owner_a, payload)
+        dispatch(owner_b, payload)
+
+        assert len(events_a) == 1  # unchanged after unbind
+        assert len(events_b) == 2  # still increments
+
+    def test_unbind_is_idempotent(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+
+        owner = FakeOwner()
+        unbind = bind_load_monitor(owner, lambda r, c: None)
+        unbind()
+        unbind()  # must not raise
+
+    def test_owner_gc_removes_registry_entry(self):
+        from sglang.srt.load_reporter.decorator import _REGISTRY, bind_load_monitor
+
+        owner = FakeOwner()
+        bind_load_monitor(owner, lambda r, c: None)
+        owner_ref = weakref.ref(owner)
+
+        del owner
+        gc.collect()
+
+        assert owner_ref() is None
+        # WeakKeyDictionary must have cleaned up
+        assert all(owner_ref() is not k for k in list(_REGISTRY.keys()))
+
+
+# ---------------------------------------------------------------------------
+# Group 3: scheduler_message classification
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerMessageClassification:
+    def _run(self, payload, port=30100):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+
+        events: list = []
+        owner = FakeOwner(port=port)
+
+        @enable_load_monitor("scheduler_message")
+        def dispatch(self, obj: Any) -> None:
+            pass
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        dispatch(owner, payload)
+        return events
+
+    def test_single_dispatch_reason_and_count(self):
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events = self._run(make_single_dispatch())
+        assert events == [(LoadReporterRefreshReason.DISPATCH, 1)]
+
+    def test_batch_dispatch_count_matches_batch_size(self):
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        batch = make_batch_dispatch(n=5)
+        events = self._run(batch)
+        assert events == [(LoadReporterRefreshReason.DISPATCH, 5)]
+
+    def test_abort_emits_abort_reason(self):
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events = self._run(make_abort())
+        assert events == [(LoadReporterRefreshReason.ABORT, 1)]
+
+    def test_unknown_message_type_not_notified(self):
+        events = self._run(object())  # unknown payload
+        assert events == []
+
+    def test_no_event_on_sync_exception(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+
+        events: list = []
+        owner = FakeOwner()
+
+        @enable_load_monitor("scheduler_message")
+        def dispatch(self, obj: Any) -> None:
+            raise RuntimeError("boom")
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        with pytest.raises(RuntimeError, match="boom"):
+            dispatch(owner, make_single_dispatch())
+        assert events == []
+
+
+# ---------------------------------------------------------------------------
+# Group 4: request_lifecycle async generator
+# ---------------------------------------------------------------------------
+
+
+class TestRequestLifecycle:
+    @pytest.mark.asyncio
+    async def test_normal_exhaustion_emits_one_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = FakeOwner()
+
+        @enable_load_monitor("request_lifecycle")
+        async def generate(self):
+            for i in range(3):
+                yield i
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        collected = [x async for x in generate(owner)]
+        assert collected == [0, 1, 2]
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_business_exception_still_emits_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = FakeOwner()
+
+        @enable_load_monitor("request_lifecycle")
+        async def generate(self):
+            yield 1
+            raise ValueError("fail")
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        with pytest.raises(ValueError, match="fail"):
+            async for _ in generate(owner):
+                pass
+
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_consumer_aclose_emits_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = FakeOwner()
+
+        @enable_load_monitor("request_lifecycle")
+        async def generate(self):
+            for i in range(100):
+                yield i
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        gen = generate(owner)
+        await gen.__anext__()  # consume one
+        await gen.aclose()  # close early
+
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_task_cancel_emits_completion(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        owner = FakeOwner()
+
+        @enable_load_monitor("request_lifecycle")
+        async def generate(self):
+            for i in range(100):
+                yield i
+                await asyncio.sleep(0)
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+
+        async def consume():
+            async for _ in generate(owner):
+                pass
+
+        task = asyncio.ensure_future(consume())
+        await asyncio.sleep(0)  # let it start
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_does_not_mask_business_exception(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+
+        owner = FakeOwner()
+
+        @enable_load_monitor("request_lifecycle")
+        async def generate(self):
+            yield 1
+            raise ValueError("business error")
+
+        def bad_notify(r, c):
+            raise RuntimeError("notify exploded")
+
+        bind_load_monitor(owner, bad_notify)
+        with pytest.raises(ValueError, match="business error"):
+            async for _ in generate(owner):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_completion_not_fired_when_port_is_none(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+
+        events: list = []
+        owner = FakeOwner(port=None)  # reporter disabled
+
+        @enable_load_monitor("request_lifecycle")
+        async def generate(self):
+            yield 1
+            yield 2
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        collected = [x async for x in generate(owner)]
+        assert collected == [1, 2]
+        assert events == []  # bypassed entirely
+
+
+# ---------------------------------------------------------------------------
+# Group 5: port=None bypass
+# ---------------------------------------------------------------------------
+
+
+class TestPortBypass:
+    def test_sync_no_callback_when_port_none(self):
+        from sglang.srt.load_reporter.decorator import bind_load_monitor, enable_load_monitor
+
+        events: list = []
+        owner = FakeOwner(port=None)
+
+        @enable_load_monitor("scheduler_message")
+        def dispatch(self, obj: Any) -> str:
+            return "ok"
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        result = dispatch(owner, make_single_dispatch())
+        assert result == "ok"
+        assert events == []

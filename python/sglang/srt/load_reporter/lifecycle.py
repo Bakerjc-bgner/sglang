@@ -49,6 +49,7 @@ class LoadReporterLifecycle:
         self._app_state = app_state
         self._runtime: Optional[Any] = None
         self._notifier: Optional[Any] = None
+        self._unbind: Optional[Any] = None
         self._started = False
         self._closed = False
 
@@ -126,8 +127,10 @@ class LoadReporterLifecycle:
                 active,
             ),
         )
-        self._manager.set_load_reporter_request_finished_hook(
-            self._runtime.notify_request_finished
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+        self._unbind = bind_load_monitor(
+            self._manager,
+            lambda reason, count: self._runtime.notify_refresh(),
         )
         self._app_state.load_reporter_unsupported_reason = None
         self._app_state.load_reporter_runtime = self._runtime
@@ -145,7 +148,8 @@ class LoadReporterLifecycle:
             send=self._manager._dispatch_to_scheduler,
         )
         self._manager.attach_load_reporter_ipc_components(proxy, notifier)
-        self._manager.set_load_reporter_request_event_hook(notifier.notify)
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
+        self._unbind = bind_load_monitor(self._manager, notifier.notify)
         await notifier.start()
 
         self._runtime = proxy
@@ -164,10 +168,10 @@ class LoadReporterLifecycle:
 
         self._closed = True
 
-        # Step 1: Detach hooks so no late request can wake torn-down components
-        if self._runtime is not None:
-            self._manager.set_load_reporter_request_finished_hook(None)
-            self._manager.set_load_reporter_request_event_hook(None)
+        # Step 1: Detach decorator binding so no late request can wake torn-down components
+        if self._unbind is not None:
+            self._unbind()
+            self._unbind = None
 
         # Step 2: Close runtime (single-tokenizer) or notifier (multi-tokenizer)
         if self._runtime is not None:

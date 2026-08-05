@@ -103,9 +103,10 @@ class FakeAppState:
 
 @pytest.mark.asyncio
 async def test_single_tokenizer_lifecycle_owns_runtime_and_detaches_hook_on_close():
-    """Single-tokenizer mode owns runtime and detaches hooks in correct order."""
+    """Single-tokenizer mode owns runtime and calls unbind in correct order."""
     # This test will fail until lifecycle.py is implemented
     try:
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
         from sglang.srt.load_reporter.lifecycle import LoadReporterLifecycle
     except ImportError:
         pytest.skip("LoadReporterLifecycle not yet implemented")
@@ -127,14 +128,24 @@ async def test_single_tokenizer_lifecycle_owns_runtime_and_detaches_hook_on_clos
     lifecycle._runtime = runtime
     lifecycle._started = True  # Skip actual start logic
 
-    # Manually install hook to simulate what start() does
-    manager.set_load_reporter_request_finished_hook(runtime.notify_request_finished)
+    # Manually bind to simulate what start() does via bind_load_monitor
+    unbind_called = []
+    original_unbind = bind_load_monitor(
+        manager, lambda reason, count: runtime.notify_request_finished()
+    )
 
-    # Close should: (1) detach hooks (2) close runtime (3) not crash on hook=None
+    def tracked_unbind():
+        unbind_called.append(True)
+        original_unbind()
+
+    lifecycle._unbind = tracked_unbind
+
+    # Close should: (1) call unbind (2) close runtime (3) not crash on None
     await lifecycle.close()
 
-    # Verify detach happened before close
-    assert "request_finished_hook" in manager.detach_calls
+    # Verify unbind was called before close
+    assert len(unbind_called) == 1
+    assert lifecycle._unbind is None
     assert runtime.close_called
 
     # Second close should be idempotent
@@ -184,6 +195,7 @@ async def test_multi_tokenizer_lifecycle_installs_proxy_and_notifier_only():
 async def test_close_is_idempotent_after_partial_start_failure():
     """Close cleans up successfully-created resources even if start failed."""
     try:
+        from sglang.srt.load_reporter.decorator import bind_load_monitor
         from sglang.srt.load_reporter.lifecycle import LoadReporterLifecycle
     except ImportError:
         pytest.skip("LoadReporterLifecycle not yet implemented")
@@ -202,8 +214,17 @@ async def test_close_is_idempotent_after_partial_start_failure():
     lifecycle._runtime = runtime
     lifecycle._started = True
 
-    # Simulate partial start: hook installed
-    manager.set_load_reporter_request_finished_hook(runtime.notify_request_finished)
+    # Simulate partial start: bind_load_monitor installed
+    unbind_called = []
+    original_unbind = bind_load_monitor(
+        manager, lambda reason, count: runtime.notify_request_finished()
+    )
+
+    def tracked_unbind():
+        unbind_called.append(True)
+        original_unbind()
+
+    lifecycle._unbind = tracked_unbind
 
     # Now simulate close error
     runtime.close_error = RuntimeError("simulated close error")
@@ -212,7 +233,7 @@ async def test_close_is_idempotent_after_partial_start_failure():
     await lifecycle.close()  # Should log error but not raise
 
     assert runtime.close_called
-    assert "request_finished_hook" in manager.detach_calls
+    assert len(unbind_called) == 1
 
 
 @pytest.mark.asyncio

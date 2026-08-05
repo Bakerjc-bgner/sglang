@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package router.loadmonitor.v1;
+package sglang.router.loadmonitor.v1;
 
 import "google/protobuf/empty.proto";
 
