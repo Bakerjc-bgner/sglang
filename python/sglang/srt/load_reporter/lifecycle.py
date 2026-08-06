@@ -148,37 +148,6 @@ async def start_load_reporter(
     )
 
 
-async def start_http_load_reporter(
-    server_args: Any,
-    event_owner: Any,
-    *,
-    single_tokenizer: bool,
-) -> Optional[LoadReporterHandle]:
-    """Start the HTTP-served reporter and return its handle (or ``None``).
-
-    Thin HTTP-specific wrapper over :func:`start_load_reporter`: it only builds a
-    single-tokenizer ``ManagerLoadSnapshotSource``; the multi-tokenizer worker
-    path forwards refresh hints over IPC (``snapshot_source=None``).  The caller
-    owns the returned handle and must ``await handle.close()`` on shutdown.
-    """
-    if getattr(server_args, "load_reporter_port", None) is None:
-        return None
-
-    snapshot_source = None
-    if single_tokenizer:
-        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
-
-        snapshot_source = ManagerLoadSnapshotSource(
-            event_owner, range(server_args.dp_size)
-        )
-
-    return await start_load_reporter(
-        server_args,
-        snapshot_source,
-        event_owner=event_owner,
-    )
-
-
 async def _start_ipc_worker(
     server_args: Any, event_owner: Optional[Any]
 ) -> Optional[LoadReporterHandle]:

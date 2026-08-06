@@ -281,9 +281,11 @@ class TestOwnerPath:
 
 class TestHttpLifecycleAdapter:
     @pytest.mark.asyncio
-    async def test_start_returns_handle_and_close_releases_port(self):
-        """start_http_load_reporter returns a handle; close() releases the port."""
-        from sglang.srt.load_reporter.lifecycle import start_http_load_reporter
+    async def test_single_tokenizer_start_returns_handle_and_close_releases_port(self):
+        """HTTP single-tokenizer calls start_load_reporter directly (symmetric
+        with the native-gRPC path); close() releases the listener port."""
+        from sglang.srt.load_reporter.lifecycle import start_load_reporter
+        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", 0))
@@ -292,7 +294,11 @@ class TestHttpLifecycleAdapter:
 
         owner = FakeOwner(port=port)
         args = make_server_args(port=port)
-        handle = await start_http_load_reporter(args, owner, single_tokenizer=True)
+        handle = await start_load_reporter(
+            args,
+            ManagerLoadSnapshotSource(owner, range(args.dp_size)),
+            event_owner=owner,
+        )
         assert handle is not None
 
         await handle.close()

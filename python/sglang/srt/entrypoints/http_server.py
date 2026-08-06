@@ -383,14 +383,27 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    from sglang.srt.load_reporter.lifecycle import start_http_load_reporter
-
     single_tokenizer = getattr(fast_api_app, "is_single_tokenizer_mode", False)
-    reporter_handle = await start_http_load_reporter(
-        server_args,
-        _global_state.tokenizer_manager,
-        single_tokenizer=single_tokenizer,
-    )
+    reporter_handle = None
+    if server_args.load_reporter_port is not None:
+        from sglang.srt.load_reporter import start_load_reporter
+        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+
+        # Single-tokenizer reads scheduler load directly; a multi-tokenizer
+        # worker passes no source and forwards refresh hints to the sole router
+        # over IPC.
+        snapshot_source = (
+            ManagerLoadSnapshotSource(
+                _global_state.tokenizer_manager, range(server_args.dp_size)
+            )
+            if single_tokenizer
+            else None
+        )
+        reporter_handle = await start_load_reporter(
+            server_args,
+            snapshot_source,
+            event_owner=_global_state.tokenizer_manager,
+        )
     try:
         if (
             single_tokenizer
