@@ -15,6 +15,12 @@ impl Config {
         if self.model.id.is_empty() {
             return Err(anyhow!("model id must be non-empty"));
         }
+        if !self.load_monitor.enabled && self.load_monitor.reporter_port.is_some() {
+            return Err(anyhow!("--load-reporter-port requires --load-monitor"));
+        }
+        if self.load_monitor.enabled && self.load_monitor.reporter_port.is_none() {
+            return Err(anyhow!("--load-monitor requires --load-reporter-port"));
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
@@ -94,6 +100,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            load_monitor: LoadMonitorConfig::default(),
         }
     }
 
