@@ -292,27 +292,6 @@ class Engine(EngineScoreMixin, EngineBase):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
-        self._load_reporter_handle = None
-        if (
-            server_args.load_reporter_port is not None
-            and tokenizer_manager is not None
-            and not isinstance(tokenizer_manager, MultiTokenizerRouter)
-        ):
-            from sglang.srt.load_reporter.lifecycle import (
-                start_load_reporter_in_background,
-            )
-            from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
-
-            self._load_reporter_handle = start_load_reporter_in_background(
-                server_args,
-                ManagerLoadSnapshotSource(
-                    tokenizer_manager,
-                    range(server_args.dp_size),
-                    snapshot_reader=tokenizer_manager.load_snapshot_reader,
-                ),
-                event_owner=tokenizer_manager,
-            )
-
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
         return self._scheduler_init_result.all_child_pids
@@ -1159,14 +1138,6 @@ class Engine(EngineScoreMixin, EngineBase):
         device."""
         if isinstance(self.tokenizer_manager, MultiTokenizerRouter):
             self.tokenizer_manager.close()
-
-        reporter_handle = getattr(self, "_load_reporter_handle", None)
-        if reporter_handle is not None:
-            self._load_reporter_handle = None
-            try:
-                reporter_handle.close()
-            except Exception:
-                logger.exception("Load reporter shutdown failed")
 
         if (
             self.tokenizer_manager is not None

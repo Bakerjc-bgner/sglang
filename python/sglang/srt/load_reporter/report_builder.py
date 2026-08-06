@@ -100,8 +100,6 @@ class ReportBuilder:
         )
         if identity.model is not None:
             report.worker.model = identity.model
-        if identity.zone is not None:
-            report.worker.zone = identity.zone
         if error is not None:
             report.last_error = error
         return report

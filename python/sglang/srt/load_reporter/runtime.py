@@ -59,7 +59,9 @@ class _RouterSession:
         identity: WorkerMetadata,
         on_close: Callable[[str, "_RouterSession"], None],
         on_schedule_changed: Callable[[], None],
-        initial_sample_completed: asyncio.Event,
+        sample_baseline: int,
+        sample_generation: Callable[[], int],
+        sample_event: Callable[[], asyncio.Event],
     ) -> None:
         _validate_timing(report_interval_ms, lease_ttl_ms)
         now = time.monotonic()
@@ -73,7 +75,12 @@ class _RouterSession:
         self._identity = identity
         self._on_close = on_close
         self._on_schedule_changed = on_schedule_changed
-        self._initial_sample_completed = initial_sample_completed
+        # Generation barrier: wait for a sample completing *after* this session
+        # registered, so a re-registration never reuses an earlier session's
+        # latched completion (I5).
+        self._sample_baseline = sample_baseline
+        self._sample_generation = sample_generation
+        self._sample_event = sample_event
 
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         self._done: asyncio.Event = asyncio.Event()
@@ -171,8 +178,12 @@ class _RouterSession:
             report_time_unix_ms=int(time.time() * 1000),
         )
 
+    def _fresh_sample_ready(self) -> bool:
+        """True once a sampling attempt has completed after registration."""
+        return self._sample_generation() > self._sample_baseline
+
     async def _wait_for_initial_sample(self) -> bool:
-        """Wait for one sampling attempt, bounded by timeout and lease."""
+        """Wait for a post-registration sampling attempt, bounded by timeout/lease."""
         deadline = time.monotonic() + INITIAL_SAMPLE_TIMEOUT_SECONDS
         while True:
             if self._done.is_set():
@@ -182,17 +193,17 @@ class _RouterSession:
             if now >= self._lease_expires_at:
                 logger.info("Lease expired for router_id=%s", self._router_id)
                 return False
-            if self._initial_sample_completed.is_set() or now >= deadline:
+            if self._fresh_sample_ready() or now >= deadline:
                 return True
 
             self._config_changed.clear()
-            if self._done.is_set() or self._initial_sample_completed.is_set():
+            if self._done.is_set() or self._fresh_sample_ready():
                 continue
 
             wait_timeout = max(
                 0.0, min(deadline, self._lease_expires_at) - time.monotonic()
             )
-            sample_wait = asyncio.create_task(self._initial_sample_completed.wait())
+            sample_wait = asyncio.create_task(self._sample_event().wait())
             config_wait = asyncio.create_task(self._config_changed.wait())
             try:
                 await asyncio.wait(
@@ -291,7 +302,13 @@ class LoadReporterRuntime:
         self._snapshot_source = snapshot_source
 
         self._store = LatestSnapshotStore()
-        self._initial_sample_completed = asyncio.Event()
+        # Sampling generation barrier: monotonic counter bumped once per
+        # completed sampling attempt, plus a pulsed event so a waiter can block
+        # for a sample that lands *after* it registered.  A session captures the
+        # current generation at registration and waits until the counter moves
+        # past that baseline, so re-registrations never reuse a stale sample.
+        self._sample_generation = 0
+        self._sample_completed = asyncio.Event()
         self._builder = ReportBuilder(
             str(uuid.uuid4()),
             self._config.snapshot_stale_after_ms,
@@ -302,8 +319,28 @@ class LoadReporterRuntime:
             snapshot_source,
             self._store,
             interval_provider=self._min_report_interval_ms,
-            on_sample_completed=self._initial_sample_completed.set,
+            on_sample_completed=self._on_sample_completed,
         )
+
+    def _on_sample_completed(self) -> None:
+        """Advance the sampling generation and wake waiters once per sample.
+
+        Uses swap-on-set (rather than set-then-clear) so a waiter that has
+        created its wait task but not yet parked on the event still observes the
+        completion: the old event stays set forever and future waiters block on
+        a fresh event.
+        """
+        self._sample_generation += 1
+        completed, self._sample_completed = self._sample_completed, asyncio.Event()
+        completed.set()
+
+    def _current_sample_generation(self) -> int:
+        """Return the latest completed sampling generation."""
+        return self._sample_generation
+
+    def _sample_event(self) -> asyncio.Event:
+        """Return the event that fires when the next sampling attempt completes."""
+        return self._sample_completed
 
     # ------------------------------------------------------------------
     # Session management (inbound Router streams)
@@ -334,6 +371,11 @@ class LoadReporterRuntime:
         if old is not None:
             old.stop()
 
+        # Capture the sampling baseline before (re)activating the sampler so the
+        # session's initial report waits for a sample completing after this
+        # registration, never an earlier session's latched completion (I5).
+        sample_baseline = self._sample_generation
+
         session = _RouterSession(
             router_id=router_id,
             report_interval_ms=report_interval_ms,
@@ -343,7 +385,9 @@ class LoadReporterRuntime:
             identity=self._worker_metadata,
             on_close=self._on_session_closed,
             on_schedule_changed=self._on_schedule_changed,
-            initial_sample_completed=self._initial_sample_completed,
+            sample_baseline=sample_baseline,
+            sample_generation=self._current_sample_generation,
+            sample_event=self._sample_event,
         )
         self._sessions[router_id] = session
         self._on_schedule_changed()

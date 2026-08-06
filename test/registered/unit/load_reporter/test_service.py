@@ -35,10 +35,8 @@ def make_server_args(dp_size: int = 1) -> types.SimpleNamespace:
     args = types.SimpleNamespace()
     args.host = "127.0.0.1"
     args.load_reporter_port = 9999
-    args.load_reporter_snapshot_stale_after_ms = 30_000
     args.disaggregation_mode = "none"
     args.served_model_name = "test-model"
-    args.load_reporter_zone = None
     args.dp_size = dp_size
     return args
 

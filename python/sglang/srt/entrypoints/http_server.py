@@ -383,49 +383,51 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    from sglang.srt.load_reporter.lifecycle import http_load_reporter_lifespan
+    from sglang.srt.load_reporter.lifecycle import start_http_load_reporter
 
     single_tokenizer = getattr(fast_api_app, "is_single_tokenizer_mode", False)
-    async with http_load_reporter_lifespan(
+    reporter_handle = await start_http_load_reporter(
         server_args,
         _global_state.tokenizer_manager,
         single_tokenizer=single_tokenizer,
-    ):
-        try:
-            if (
-                single_tokenizer
-                and server_args.grpc_port is not None
-                and not (server_args.smg_grpc_mode or server_args.grpc_mode)
-            ):
-                grpc_handle = _start_native_grpc_server_for_runtime(
-                    server_args=server_args,
-                    tokenizer_manager=_global_state.tokenizer_manager,
-                    template_manager=_global_state.template_manager,
-                    scheduler_info=_global_state.scheduler_info,
-                )
-                if server_args.sidecar is not None:
-                    from sglang.srt.entrypoints.sidecar import start_sidecar
-
-                    sidecar = start_sidecar(server_args)
-
-            warmup_thread = threading.Thread(
-                target=_wait_and_warmup,
-                kwargs=warmup_thread_kwargs,
+    )
+    try:
+        if (
+            single_tokenizer
+            and server_args.grpc_port is not None
+            and not (server_args.smg_grpc_mode or server_args.grpc_mode)
+        ):
+            grpc_handle = _start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=_global_state.tokenizer_manager,
+                template_manager=_global_state.template_manager,
+                scheduler_info=_global_state.scheduler_info,
             )
-            warmup_thread.start()
+            if server_args.sidecar is not None:
+                from sglang.srt.entrypoints.sidecar import start_sidecar
 
-            yield
-        finally:
-            if sidecar is not None:
-                try:
-                    sidecar.stop()
-                except Exception:
-                    logger.exception("Failed to stop sidecar")
-            _shutdown_native_grpc_server(grpc_handle)
-            if tool_server is not None and hasattr(tool_server, "aclose"):
-                await tool_server.aclose()
-            if warmup_thread is not None:
-                warmup_thread.join()
+                sidecar = start_sidecar(server_args)
+
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            kwargs=warmup_thread_kwargs,
+        )
+        warmup_thread.start()
+
+        yield
+    finally:
+        if sidecar is not None:
+            try:
+                sidecar.stop()
+            except Exception:
+                logger.exception("Failed to stop sidecar")
+        _shutdown_native_grpc_server(grpc_handle)
+        if tool_server is not None and hasattr(tool_server, "aclose"):
+            await tool_server.aclose()
+        if warmup_thread is not None:
+            warmup_thread.join()
+        if reporter_handle is not None:
+            await reporter_handle.close()
 
 
 # Fast API

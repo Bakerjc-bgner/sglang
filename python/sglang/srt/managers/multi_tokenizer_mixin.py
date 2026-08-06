@@ -83,6 +83,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _await_reporter_startup(
+    future: "concurrent.futures.Future",
+    loop: asyncio.AbstractEventLoop,
+    timeout: float,
+) -> Optional[Any]:
+    """Block on the router reporter startup future, cleaning up on timeout.
+
+    On timeout the pending startup coroutine is cancelled so it cannot keep
+    running (and bind the reporter port) after router construction has failed.
+    A done-callback also guards the cancel-vs-complete race: if the coroutine
+    had already produced a handle by the time we cancel, that late handle is
+    closed on ``loop`` so no listener leaks.  The ``TimeoutError`` is re-raised
+    to fail construction.
+    """
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+
+        def _close_if_produced(fut: "concurrent.futures.Future") -> None:
+            # Fires when the future settles.  A won cancel leaves it cancelled
+            # (the coroutine's own teardown releases the partial handle); a lost
+            # cancel leaves a real handle here that must not leak.
+            if fut.cancelled():
+                return
+            try:
+                handle = fut.result()
+            except Exception:
+                return
+            if handle is not None:
+                loop.call_soon_threadsafe(lambda: loop.create_task(handle.close()))
+
+        future.add_done_callback(_close_if_produced)
+        logger.warning("Timed out starting the router-owned load reporter")
+        raise TimeoutError("router load reporter startup timed out")
+
+
 class SocketMapping:
     def __init__(self):
         self._zmq_context = zmq.Context()
@@ -518,7 +555,7 @@ class MultiTokenizerRouter:
             start_load_reporter(self.server_args, source, event_owner=None),
             self._loop,
         )
-        return future.result(timeout=10.0)
+        return _await_reporter_startup(future, self._loop, timeout=10.0)
 
     def _handle_load_reporter_refresh(self, request: LoadReporterRefreshIpcReq) -> None:
         """Forward a worker refresh hint to the router-owned reporter."""

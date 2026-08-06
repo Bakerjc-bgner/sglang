@@ -19,29 +19,33 @@ from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-# Reporter-internal implementation constants (seconds). Not CLI arguments.
+# Reporter-internal implementation constants. Not CLI arguments.
 INITIAL_SAMPLE_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
+# Maximum accepted age of the oldest rank snapshot before a report is marked
+# STALE. Reporter-internal; intentionally not surfaced as a CLI argument.
+SNAPSHOT_STALE_AFTER_MS = 3000
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class LoadReporterConfig:
-    """Timing configuration for the load reporter derived from ServerArgs."""
+    """Timing configuration for the load reporter."""
 
     snapshot_stale_after_ms: int
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> LoadReporterConfig:
-        """Build reporter timing configuration from server arguments.
+        """Build reporter timing configuration.
 
         Args:
-            args: Resolved SGLang server configuration.
+            args: Resolved SGLang server configuration (unused; the stale
+                threshold is a reporter-internal constant).
 
         Returns:
             Frozen load-reporter timing configuration.
         """
         return cls(
-            snapshot_stale_after_ms=args.load_reporter_snapshot_stale_after_ms,
+            snapshot_stale_after_ms=SNAPSHOT_STALE_AFTER_MS,
         )
 
 
@@ -52,7 +56,6 @@ class WorkerMetadata:
     worker_addr: str
     worker_type: int
     model: Optional[str]
-    zone: Optional[str]
 
     @classmethod
     def from_server_args(cls, args: ServerArgs) -> WorkerMetadata:
@@ -62,7 +65,7 @@ class WorkerMetadata:
             args: Resolved SGLang server configuration.
 
         Returns:
-            Frozen worker address, type, model, and zone metadata.
+            Frozen worker address, type, and model metadata.
         """
         worker_type = {
             "prefill": pb.WORKER_TYPE_PREFILL,
@@ -73,5 +76,4 @@ class WorkerMetadata:
             worker_addr=worker_addr,
             worker_type=worker_type,
             model=args.served_model_name,
-            zone=args.load_reporter_zone,
         )

@@ -45,10 +45,8 @@ def make_server_args(
     args.smg_http_sidecar_port = sidecar_port
     args.enable_metrics = False
     args.load_reporter_port = port
-    args.load_reporter_snapshot_stale_after_ms = 30_000
     args.disaggregation_mode = "none"
     args.served_model_name = "test-model"
-    args.load_reporter_zone = None
     args.dp_size = 1
     return args
 

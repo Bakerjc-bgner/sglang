@@ -42,10 +42,8 @@ def make_server_args(
     args = types.SimpleNamespace()
     args.host = "127.0.0.1"
     args.load_reporter_port = port
-    args.load_reporter_snapshot_stale_after_ms = 30_000
     args.disaggregation_mode = "none"
     args.served_model_name = "test-model"
-    args.load_reporter_zone = None
     args.dp_size = dp_size
     args.tokenizer_worker_num = worker_num
     return args
@@ -160,9 +158,8 @@ class TestDisabled:
 
             args = types.SimpleNamespace(
                 host="127.0.0.1", load_reporter_port=None,
-                load_reporter_snapshot_stale_after_ms=30000,
                 disaggregation_mode="none", served_model_name="m",
-                load_reporter_zone=None, dp_size=1, tokenizer_worker_num=1,
+                dp_size=1, tokenizer_worker_num=1,
             )
             h = asyncio.get_event_loop().run_until_complete(
                 start_load_reporter(args, None, event_owner=None)
@@ -282,104 +279,11 @@ class TestOwnerPath:
             await handle.close()
 
 
-class TestBackgroundOwnerPath:
-    @pytest.mark.asyncio
-    async def test_serves_periodic_reports_while_engine_caller_is_idle(self):
-        from sglang.srt.load_reporter.lifecycle import (
-            start_load_reporter_in_background,
-        )
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        sock.close()
-
-        reporter = start_load_reporter_in_background(
-            make_server_args(port=port), FakeSnapshotSource(), event_owner=None
-        )
-        assert reporter is not None
-        channel = None
-        try:
-            stub, channel = await start_client(port)
-
-            async def frames() -> AsyncIterator[pb.RouterFrame]:
-                yield pb.RouterFrame(
-                    register=pb.RegisterRequest(
-                        router_id="engine-router",
-                        report_interval_ms=40,
-                        lease_ttl_ms=10_000,
-                    )
-                )
-                await asyncio.sleep(0.5)
-
-            received = await receive_frames(stub.Monitor(frames()), 4, timeout=1.0)
-
-            assert received[0].WhichOneof("payload") == "registered"
-            reports = [
-                frame for frame in received if frame.WhichOneof("payload") == "report"
-            ]
-            assert len(reports) >= 2
-        finally:
-            if channel is not None:
-                await channel.close()
-            reporter.close()
-
-    @pytest.mark.asyncio
-    async def test_request_completion_wakes_background_sampler_thread_safely(self):
-        from sglang.srt.load_reporter.lifecycle import (
-            start_load_reporter_in_background,
-        )
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        sock.close()
-
-        source = FakeSnapshotSource()
-        owner = FakeOwner(port=port)
-        generate = owner.make_generate()
-        reporter = start_load_reporter_in_background(
-            make_server_args(port=port), source, event_owner=owner
-        )
-        assert reporter is not None
-        channel = None
-        try:
-            stub, channel = await start_client(port)
-
-            async def frames() -> AsyncIterator[pb.RouterFrame]:
-                yield pb.RouterFrame(
-                    register=pb.RegisterRequest(
-                        router_id="engine-router",
-                        report_interval_ms=100_000,
-                        lease_ttl_ms=100_000,
-                    )
-                )
-                await asyncio.sleep(1.0)
-
-            call = stub.Monitor(frames())
-            await receive_frames(call, 2, timeout=1.0)
-            await asyncio.sleep(0.1)
-            calls_before = source.get_loads_calls
-
-            assert [item async for item in generate(owner)] == [0, 1, 2]
-            deadline = asyncio.get_running_loop().time() + 0.5
-            while (
-                source.get_loads_calls == calls_before
-                and asyncio.get_running_loop().time() < deadline
-            ):
-                await asyncio.sleep(0.01)
-
-            assert source.get_loads_calls > calls_before
-        finally:
-            if channel is not None:
-                await channel.close()
-            reporter.close()
-
-
 class TestHttpLifecycleAdapter:
     @pytest.mark.asyncio
-    async def test_failure_inside_lifespan_releases_reporter_port(self):
-        from sglang.srt.load_reporter.lifecycle import http_load_reporter_lifespan
+    async def test_start_returns_handle_and_close_releases_port(self):
+        """start_http_load_reporter returns a handle; close() releases the port."""
+        from sglang.srt.load_reporter.lifecycle import start_http_load_reporter
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", 0))
@@ -388,9 +292,10 @@ class TestHttpLifecycleAdapter:
 
         owner = FakeOwner(port=port)
         args = make_server_args(port=port)
-        with pytest.raises(RuntimeError, match="startup failed"):
-            async with http_load_reporter_lifespan(args, owner, single_tokenizer=True):
-                raise RuntimeError("startup failed")
+        handle = await start_http_load_reporter(args, owner, single_tokenizer=True)
+        assert handle is not None
+
+        await handle.close()
 
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -590,6 +495,92 @@ class TestHandleDelegation:
             if channel is not None:
                 await channel.close()
             await owner_handle.close()
+
+
+class TestCloseCancellationSafety:
+    """I1: a close() cancelled mid-await must not abandon remaining teardown."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_close_still_completes_teardown(self):
+        from sglang.srt.load_reporter.lifecycle import LoadReporterHandle
+
+        steps: List[str] = []
+        server_entered = asyncio.Event()
+        release_server = asyncio.Event()
+
+        class FakeServer:
+            async def stop(self, grace=None):
+                steps.append("server.stop.enter")
+                server_entered.set()
+                await release_server.wait()
+                steps.append("server.stop.exit")
+
+        class FakeRuntime:
+            async def close(self):
+                steps.append("runtime.close")
+
+        class FakeNotifier:
+            async def close(self):
+                steps.append("notifier.close")
+
+        handle = LoadReporterHandle()
+        handle._server = FakeServer()
+        handle._runtime = FakeRuntime()
+        handle._notifier = FakeNotifier()
+        handle._unbind = lambda: steps.append("unbind")
+        handle._restore = lambda: steps.append("restore")
+
+        # First caller enters close() and is cancelled while inside server.stop.
+        first = asyncio.create_task(handle.close())
+        await asyncio.wait_for(server_entered.wait(), timeout=1.0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        # The shared teardown must survive the cancelled caller: release the
+        # blocking step and let a second caller await the same close task.
+        release_server.set()
+        await handle.close()
+
+        assert steps == [
+            "server.stop.enter",
+            "server.stop.exit",
+            "runtime.close",
+            "notifier.close",
+            "unbind",
+            "restore",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_second_caller_awaits_shared_teardown(self):
+        from sglang.srt.load_reporter.lifecycle import LoadReporterHandle
+
+        runtime_closed = asyncio.Event()
+        release_runtime = asyncio.Event()
+        steps: List[str] = []
+
+        class FakeRuntime:
+            async def close(self):
+                runtime_closed.set()
+                await release_runtime.wait()
+                steps.append("runtime.close")
+
+        handle = LoadReporterHandle()
+        handle._runtime = FakeRuntime()
+        handle._unbind = lambda: steps.append("unbind")
+
+        first = asyncio.create_task(handle.close())
+        await asyncio.wait_for(runtime_closed.wait(), timeout=1.0)
+        # Second caller joins while the shared teardown is still in-flight.
+        second = asyncio.create_task(handle.close())
+        await asyncio.sleep(0)
+        assert not first.done()
+        assert not second.done()
+
+        release_runtime.set()
+        await asyncio.gather(first, second)
+        # Teardown ran exactly once even though two callers awaited it.
+        assert steps == ["runtime.close", "unbind"]
 
 
 class TestLifecycleShadowRestoration:

@@ -400,6 +400,73 @@ class TestRequestLifecycle:
         assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
 
     @pytest.mark.asyncio
+    async def test_early_aclose_finalizes_underlying_source(self):
+        """I2: closing the wrapper early must close the underlying generator so
+        its ``finally`` (request cleanup) runs, not just the COMPLETION event."""
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        source_finalized: list = []
+        owner = FakeOwner()
+
+        @enable_load_monitor("request_lifecycle")
+        async def generate(self):
+            try:
+                for i in range(100):
+                    yield i
+            finally:
+                source_finalized.append(True)
+
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        gen = generate(owner)
+        await gen.__anext__()  # suspend inside the underlying source
+        await gen.aclose()  # close the wrapper early
+
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+        assert source_finalized == [
+            True
+        ], "underlying source generator must be finalized on early aclose"
+
+    @pytest.mark.asyncio
+    async def test_early_aclose_finalizes_bound_underlying_source(self):
+        """I2 (bound style): early aclose finalizes the underlying bound source."""
+        from sglang.srt.load_reporter.decorator import (
+            bind_load_monitor,
+            enable_load_monitor,
+        )
+        from sglang.srt.managers.io_struct import LoadReporterRefreshReason
+
+        events: list = []
+        source_finalized: list = []
+
+        class Owner:
+            def __init__(self) -> None:
+                self.server_args = FakeServerArgs(port=30100)
+
+            async def generate_request(self, tag: str = "x"):
+                try:
+                    for i in range(100):
+                        yield (tag, i)
+                finally:
+                    source_finalized.append(True)
+
+        owner = Owner()
+        bind_load_monitor(owner, lambda r, c: events.append((r, c)))
+        # Bound-method style: decorate the instance's bound method (standalone
+        # SMG RPC shape).
+        decorated = enable_load_monitor("request_lifecycle")(owner.generate_request)
+        gen = decorated("t")
+        await gen.__anext__()
+        await gen.aclose()
+
+        assert events == [(LoadReporterRefreshReason.COMPLETION, 1)]
+        assert source_finalized == [True]
+
+    @pytest.mark.asyncio
     async def test_task_cancel_emits_completion(self):
         from sglang.srt.load_reporter.decorator import (
             bind_load_monitor,

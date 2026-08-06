@@ -1489,12 +1489,6 @@ class ServerArgs:
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
         NS("observability"),
     ] = 15
-    load_reporter_snapshot_stale_after_ms: A[
-        int, "Load reporter snapshot stale threshold in milliseconds."
-    ] = 3000
-    load_reporter_zone: A[
-        Optional[str], "Optional zone reported in Worker metadata."
-    ] = None
     load_reporter_port: A[
         Optional[int],
         "Port on which this worker listens for load reporter gRPC connections. "
@@ -7969,20 +7963,13 @@ class ServerArgs:
             self.soft_watchdog_timeout = 300
 
     def _handle_load_reporter_config(self):
-        """Validate load reporter configuration fields.
+        """Validate load reporter configuration.
 
-        The snapshot stale threshold must be > 0. An empty or whitespace-only
-        zone is normalized to None. gRPC transport knobs (connect timeout,
-        reconnect backoff, keepalive, message size, shutdown timeout) are
-        reporter-internal constants and are not part of ServerArgs.
+        Only the listener port is user-facing. The snapshot stale threshold and
+        gRPC transport knobs (connect timeout, reconnect backoff, keepalive,
+        message size, shutdown timeout) are reporter-internal constants and are
+        not part of ServerArgs.
         """
-        if self.load_reporter_snapshot_stale_after_ms <= 0:
-            raise ValueError(
-                f"--load-reporter-snapshot-stale-after-ms must be positive "
-                f"(got {self.load_reporter_snapshot_stale_after_ms})."
-            )
-        if self.load_reporter_zone is not None and not self.load_reporter_zone.strip():
-            self.load_reporter_zone = None
         if self.load_reporter_port is not None and not (
             1 <= self.load_reporter_port <= 65535
         ):

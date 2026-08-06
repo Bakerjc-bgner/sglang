@@ -30,10 +30,8 @@ def make_server_args(dp_size: int = 1) -> types.SimpleNamespace:
     args = types.SimpleNamespace()
     args.host = "127.0.0.1"
     args.load_reporter_port = 9999
-    args.load_reporter_snapshot_stale_after_ms = 30_000
     args.disaggregation_mode = "none"
     args.served_model_name = "test-model"
-    args.load_reporter_zone = None
     args.dp_size = dp_size
     return args
 
@@ -530,6 +528,81 @@ class TestSameRouterIdReplacement:
                 "generation-blind on_close would have leaked its task"
             )
         finally:
+            await rt.close()
+
+
+class GatedReRegistrationSource:
+    """Return a snapshot immediately until gated, then block one sample.
+
+    Lets a test drive: (1) a first session's initial sample completing, then
+    (2) a later session registering while the *next* sample is held in flight.
+    """
+
+    def __init__(self) -> None:
+        self.gate = False
+        self.num_running = 1
+        self.gated_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_loads(self) -> list:
+        if self.gate:
+            self.gated_started.set()
+            await self.release.wait()
+        return [make_load_snapshot(self.num_running)]
+
+    def expected_dp_ranks(self) -> frozenset:
+        return frozenset({0})
+
+
+class TestReRegistrationFreshness:
+    @pytest.mark.asyncio
+    async def test_new_registration_waits_for_post_registration_sample(
+        self, monkeypatch
+    ):
+        """I5: a session registering after the sampler went idle must wait for a
+        fresh sample, not reuse a globally-latched completion from an earlier
+        session's sample.
+        """
+        import sglang.srt.load_reporter.runtime as runtime_module
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        # Long initial-sample timeout so the test asserts the generation barrier,
+        # not a timeout fallback.
+        monkeypatch.setattr(runtime_module, "INITIAL_SAMPLE_TIMEOUT_SECONDS", 10.0)
+
+        source = GatedReRegistrationSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            # Router A registers; its initial sample (num_running=1) completes.
+            _, session_a = rt.register_session("router-a", 10_000, 30_000)
+            first = await asyncio.wait_for(session_a.queue.get(), timeout=1.0)
+            assert first is not None
+            assert first.ranks[0].num_running_reqs == 1
+
+            # Router A closes; with no active sessions the sampler deactivates.
+            session_a.stop()
+            sentinel = await asyncio.wait_for(session_a.queue.get(), timeout=1.0)
+            assert sentinel is None
+            await asyncio.sleep(0.05)  # let on_close deactivate the sampler
+
+            # The next sample will block in flight and would report num_running=5.
+            source.gate = True
+            source.num_running = 5
+
+            # Router B registers and reactivates the sampler.  A stale global
+            # one-shot event would let it emit the old num_running=1 immediately;
+            # the generation barrier must make it wait for the fresh sample.
+            _, session_b = rt.register_session("router-b", 10_000, 30_000)
+            await asyncio.wait_for(source.gated_started.wait(), timeout=1.0)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(session_b.queue.get(), timeout=0.1)
+
+            # Once the fresh sample lands, Router B emits it.
+            source.release.set()
+            report = await asyncio.wait_for(session_b.queue.get(), timeout=1.0)
+            assert report.ranks[0].num_running_reqs == 5
+        finally:
+            source.release.set()
             await rt.close()
 
 

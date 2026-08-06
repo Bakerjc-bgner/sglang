@@ -31,6 +31,7 @@ import functools
 import inspect
 import logging
 import weakref
+from contextlib import aclosing
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,12 @@ async def _finalize_request_lifecycle(source: Any, notify: _NotifyFn):
     exactly one ``COMPLETION`` event in the ``finally`` block — covering normal
     exhaustion, early ``aclose()``, task cancellation, and unhandled exceptions.
 
+    The wrapper takes ownership of closing ``source``: ``aclosing`` guarantees
+    the underlying generator's ``finally`` (request cleanup) runs on normal
+    exhaustion, business exception, task cancellation, and an early ``aclose()``
+    on this wrapper — Python does not otherwise propagate an outer ``aclose()``
+    to a source still suspended inside ``async for``.
+
     Args:
         source: Source async iterator returned by the original method.
         notify: Callback captured by the synchronous wrapper.
@@ -184,8 +191,9 @@ async def _finalize_request_lifecycle(source: Any, notify: _NotifyFn):
     from sglang.srt.managers.io_struct import LoadReporterRefreshReason as Reason
 
     try:
-        async for item in source:
-            yield item
+        async with aclosing(source) as owned_source:
+            async for item in owned_source:
+                yield item
     finally:
         try:
             notify(Reason.COMPLETION, 1)

@@ -42,8 +42,12 @@ the snapshot source differ.
 | HTTP | FastAPI lifespan (`http_load_reporter_lifespan`) | `TokenizerManager` | static `@enable_load_monitor` on `generate_request` | initial + periodic + request-end wake |
 | native gRPC (`--grpc-port`) | reuses the same FastAPI lifespan (no second listener) | `TokenizerManager` | same static decorator | initial + periodic + request-end wake |
 | embedded Engine | `Engine.__init__` (`start_load_reporter_in_background`) | `TokenizerManager` snapshot reader | same static decorator | initial + periodic + request-end wake |
-| multi-tokenizer HTTP / native gRPC | sole `MultiTokenizerRouter` owns the port; HTTP workers bind an IPC notifier | Router shared-memory snapshot reader | HTTP workers coalesce refresh over IPC to the sole owner | initial + periodic + request-end wake |
+| multi-tokenizer HTTP (`--tokenizer-worker-num > 1`) | sole `MultiTokenizerRouter` owns the port; HTTP workers bind an IPC notifier | Router shared-memory snapshot reader | HTTP workers coalesce refresh over IPC to the sole owner | initial + periodic + request-end wake |
 | standalone SMG RPC (`--smg-grpc-mode`) | `grpc_server.py::_on_request_manager_ready` (`start_load_reporter`) | `GrpcRequestManager.get_loads(include=["core"])` | same decorator applied at runtime to the current instance's bound `generate_request` | initial + periodic + request-end wake |
+
+> **Multi-tokenizer native gRPC is not supported.** `ServerArgs` rejects
+> `--grpc-port` together with `--tokenizer-worker-num > 1`, so the reporter does
+> not claim that combination. Multi-tokenizer applies to HTTP only.
 
 **HTTP and standalone SMG RPC are symmetric**: both do register-time initial
 sampling, periodic interval sampling, and request-end active wake-up.
@@ -123,10 +127,10 @@ own shadow, never a later replacement).
 ## Protocol
 
 Canonical IDL: `proto/sglang/router/loadmonitor/v1/load_monitor.proto` (package
-`sglang.router.loadmonitor.v1`) — regenerate the Python bindings with
-`scripts/generate_load_reporter_proto.sh` (`--check` verifies reproducibility).
-It is the single wire-contract input for the external Router; do not copy it or
-its generated artifacts into Router-side test fixtures.
+`sglang.router.loadmonitor.v1`). Regenerate the Python bindings with `protoc`
+(grpcio-tools) into `python/sglang/srt/load_reporter/proto/`. It is the single
+wire-contract input for the external Router; do not copy it or its generated
+artifacts into Router-side test fixtures.
 
 ```protobuf
 service LoadMonitorService {
