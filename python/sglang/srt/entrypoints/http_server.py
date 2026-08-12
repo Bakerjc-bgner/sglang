@@ -396,19 +396,15 @@ async def lifespan(fast_api_app: FastAPI):
         from sglang.srt.load_reporter import start_load_reporter
         from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
 
-        # Multi-tokenizer workers forward refresh hints to the router over IPC.
-        snapshot_source = (
-            ManagerLoadSnapshotSource(
+        # Only the single-tokenizer process owns the reporter port and runtime.
+        if single_tokenizer:
+            snapshot_source = ManagerLoadSnapshotSource(
                 _global_state.tokenizer_manager, range(server_args.dp_size)
             )
-            if single_tokenizer
-            else None
-        )
-        reporter_handle = await start_load_reporter(
-            server_args,
-            snapshot_source,
-            event_owner=_global_state.tokenizer_manager,
-        )
+            reporter_handle = await start_load_reporter(
+                server_args,
+                snapshot_source,
+            )
     try:
         if (
             single_tokenizer

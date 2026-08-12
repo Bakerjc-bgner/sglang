@@ -229,8 +229,6 @@ async def serve_grpc(server_args, model_info=None):
             reporter_handle = await start_load_reporter(
                 server_args,
                 ManagerLoadSnapshotSource(request_manager, range(server_args.dp_size)),
-                event_owner=request_manager,
-                request_lifecycle_method="generate_request",
             )
 
     # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,

@@ -118,11 +118,6 @@ class LoadSampler:
         self._active = False
         self._wake.set()
 
-    def notify_refresh(self) -> None:
-        """Request a fresh sample."""
-        if self._active and not self._closing:
-            self._wake.set()
-
     def notify_schedule_changed(self) -> None:
         """Wake the loop to recompute its timer interval."""
         if self._active and not self._closing:

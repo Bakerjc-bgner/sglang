@@ -1,7 +1,7 @@
 """Integration tests for LoadMonitorService using a real grpc.aio in-process server.
 
 The Worker is the gRPC server; the fake Router is the gRPC client.
-Tests cover: normal handshake, periodic reporting (no decorator events),
+Tests cover: normal handshake, periodic reporting (no request activity),
 illegal first frame, client cancel, server shutdown, same-router_id
 stream replacement, and the fixed-port-occupied failure path.
 """
@@ -155,8 +155,8 @@ class TestNormalHandshake:
 
 class TestContinuousReporting:
     @pytest.mark.asyncio
-    async def test_reports_flow_without_decorator_events(self):
-        """Reports must flow on interval even with NO decorator events."""
+    async def test_reports_flow_without_request_activity(self):
+        """Reports must flow on interval without inference request activity."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         rt = LoadReporterRuntime(FakeSnapshotSource(), make_server_args())

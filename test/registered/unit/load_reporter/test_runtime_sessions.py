@@ -100,13 +100,22 @@ class MutableSnapshotSource:
     def __init__(self) -> None:
         self.num_running_reqs = 1
         self.get_loads_calls = 0
+        self._dp_size = 1
+        self._rank_updates: list = []
 
     async def get_loads(self) -> list:
         self.get_loads_calls += 1
         return [make_load_snapshot(self.num_running_reqs)]
 
     def expected_dp_ranks(self) -> frozenset:
-        return frozenset({0})
+        return frozenset(range(self._dp_size))
+
+    def update_expected_dp_ranks(self, ranks) -> bool:
+        self._rank_updates.append(frozenset(ranks))
+        new = frozenset(ranks)
+        changed = new != frozenset(range(self._dp_size))
+        self._dp_size = len(list(ranks))
+        return changed
 
 
 class BlockingAfterInitialSnapshotSource:
@@ -116,6 +125,8 @@ class BlockingAfterInitialSnapshotSource:
         self.get_loads_calls = 0
         self.blocked_sample_started = asyncio.Event()
         self.release = asyncio.Event()
+        self._dp_size = 1
+        self._rank_updates: list = []
 
     async def get_loads(self) -> list:
         self.get_loads_calls += 1
@@ -127,7 +138,14 @@ class BlockingAfterInitialSnapshotSource:
         return [make_load_snapshot(9)]
 
     def expected_dp_ranks(self) -> frozenset:
-        return frozenset({0})
+        return frozenset(range(self._dp_size))
+
+    def update_expected_dp_ranks(self, ranks) -> bool:
+        self._rank_updates.append(frozenset(ranks))
+        new = frozenset(ranks)
+        changed = new != frozenset(range(self._dp_size))
+        self._dp_size = len(list(ranks))
+        return changed
 
 
 async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> list:
@@ -719,34 +737,28 @@ class TestShutdown:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-class TestDecoratorEvents:
+class TestTopologyChangeEvents:
     @pytest.mark.asyncio
-    async def test_request_end_refreshes_coalesce_without_early_report(self):
-        """Refresh hints update state, but only the deadline publishes it."""
+    async def test_update_expected_dp_ranks_wakes_sampler(self):
+        """A topology change triggers an immediate sample via the rank-update path."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         source = MutableSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         try:
-            _, session = rt.register_session("r1", 400, 3000)
-            initial_report = await asyncio.wait_for(session.queue.get(), timeout=0.5)
-            assert initial_report.ranks[0].num_running_reqs == 1
-
-            source.num_running_reqs = 7
-            for _ in range(10):
-                rt.notify_refresh()
-
-            deadline = time.monotonic() + 0.2
-            while source.get_loads_calls < 2 and time.monotonic() < deadline:
+            _, session = rt.register_session("r1", 5000, 30000)
+            await asyncio.wait_for(session.queue.get(), timeout=0.5)
+            before = source.get_loads_calls
+            assert rt.update_expected_dp_ranks(range(2)) is True
+            deadline = time.monotonic() + 0.5
+            while source.get_loads_calls == before and time.monotonic() < deadline:
                 await asyncio.sleep(0.005)
-            assert source.get_loads_calls == 2
-
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(session.queue.get(), timeout=0.1)
-
-            report = await asyncio.wait_for(session.queue.get(), timeout=0.4)
-            assert report.ranks[0].num_running_reqs == 7
+            assert source.get_loads_calls > before, (
+                "topology change should sample before the 5-second deadline"
+            )
+            assert len(source._rank_updates) == 1
         finally:
+            session.stop()
             await rt.close()
 
     @pytest.mark.asyncio
@@ -757,14 +769,15 @@ class TestDecoratorEvents:
         source = BlockingAfterInitialSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         try:
-            _, session = rt.register_session("r1", 150, 3000)
+            _, session = rt.register_session("r1", 500, 3000)
             initial_report = await asyncio.wait_for(session.queue.get(), timeout=0.5)
             assert initial_report.ranks[0].num_running_reqs == 1
 
-            rt.notify_refresh()
+            # Trigger a second sample via topology change; it will block.
+            rt.update_expected_dp_ranks(range(2))
             await asyncio.wait_for(source.blocked_sample_started.wait(), timeout=0.2)
 
-            report = await asyncio.wait_for(session.queue.get(), timeout=0.3)
+            report = await asyncio.wait_for(session.queue.get(), timeout=0.7)
             assert not source.release.is_set()
             assert report.ranks[0].num_running_reqs == 1
         finally:
@@ -772,35 +785,22 @@ class TestDecoratorEvents:
             await rt.close()
 
     @pytest.mark.asyncio
-    async def test_notify_refresh_wakes_sampler(self):
+    async def test_no_sample_before_periodic_deadline(self):
+        """Initial sampling is followed by the negotiated periodic deadline."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         source = FakeSnapshotSource()
         rt = LoadReporterRuntime(source, make_server_args())
         try:
             ack, session = rt.register_session("r1", 5000, 30000)
+            await asyncio.wait_for(session.queue.get(), timeout=0.5)
             before = source.get_loads_calls
-            rt.notify_refresh()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
             after = source.get_loads_calls
-            assert after > before, "notify_refresh should trigger a sample"
-        finally:
-            session.stop()
-            await rt.close()
-
-    @pytest.mark.asyncio
-    async def test_notify_source_changed_wakes_sampler(self):
-        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
-
-        source = FakeSnapshotSource()
-        rt = LoadReporterRuntime(source, make_server_args())
-        try:
-            ack, session = rt.register_session("r1", 5000, 30000)
-            before = source.get_loads_calls
-            rt.notify_source_changed()
-            await asyncio.sleep(0.1)
-            after = source.get_loads_calls
-            assert after > before
+            assert after == before, (
+                "sampler must wait for the periodic deadline after its "
+                "initial sample"
+            )
         finally:
             session.stop()
             await rt.close()

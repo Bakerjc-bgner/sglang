@@ -3,10 +3,10 @@
 The external ``smg-grpc-servicer`` package is NOT required: these tests inject a
 fake ``_serve_grpc`` at the existing import boundary
 (``smg_grpc_servicer.sglang.server.serve_grpc``) and monkeypatch the sidecar
-helpers.  They verify that SGLang applies the SAME reporter lifecycle +
-``enable_load_monitor("request_lifecycle")`` decorator to the current
-``GrpcRequestManager`` bound method, guarded by the ``inspect.signature``
-capability check, and cleaned up on normal exit / failure / cancellation.
+helpers.  They verify that SGLang starts the reporter with a manager-backed
+snapshot source (no generate_request shadow), guarded by the
+``inspect.signature`` capability check, and cleaned up on normal exit /
+failure / cancellation.
 """
 
 from __future__ import annotations
@@ -180,7 +180,7 @@ async def receive_frames(call, count: int, timeout: float = 3.0) -> list:
 
 class TestReporterEnabledWithCapability:
     @pytest.mark.asyncio
-    async def test_client_connects_and_shadow_restored_on_exit(self, isolate_sidecar):
+    async def test_client_connects_without_shadow(self, isolate_sidecar):
         from sglang.srt.entrypoints import grpc_server
 
         port = free_port()
@@ -196,8 +196,9 @@ class TestReporterEnabledWithCapability:
                     break
             rm = holder.request_manager
             assert rm is not None
-            # generate_request is shadowed on THIS instance only.
-            assert "generate_request" in rm.__dict__
+            # generate_request is NOT shadowed — standalone SMG RPC uses the
+            # manager-backed snapshot source without wrapping generate_request.
+            assert "generate_request" not in rm.__dict__
 
             stub, channel = await start_client(port)
 
@@ -219,12 +220,12 @@ class TestReporterEnabledWithCapability:
             await asyncio.wait_for(serve_task, timeout=3.0)
             uninstall_fake_smg()
 
-        # After serve_grpc returns: port freed, instance shadow removed.
+        # After serve_grpc returns: port freed, no shadow to remove.
         assert port_is_free(port)
-        assert "generate_request" not in rm.__dict__
 
     @pytest.mark.asyncio
-    async def test_request_end_wakes_sampler(self, isolate_sidecar):
+    async def test_request_activity_does_not_wake_sampler(self, isolate_sidecar):
+        """Completing a request does not sample before the periodic deadline."""
         from sglang.srt.entrypoints import grpc_server
 
         port = free_port()
@@ -246,20 +247,20 @@ class TestReporterEnabledWithCapability:
                 yield pb.RouterFrame(
                     register=pb.RegisterRequest(
                         router_id="r1",
-                        report_interval_ms=100000,  # effectively no periodic tick
+                        report_interval_ms=100_000,
                         lease_ttl_ms=100000,
                     )
                 )
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
 
             call = stub.Monitor(frames())
-            await receive_frames(call, 2, timeout=1.0)  # ack + initial report
+            await receive_frames(call, 2, timeout=1.0)
             before = rm.get_loads_calls
-            # Drive the decorated (shadowed) generate_request to completion.
-            collected = [x async for x in rm.generate_request()]
-            assert collected == [0, 1, 2]
-            await asyncio.sleep(0.2)
-            assert rm.get_loads_calls > before, "request-end must wake the sampler"
+            assert [item async for item in rm.generate_request()] == [0, 1, 2]
+            await asyncio.sleep(0.1)
+            assert rm.get_loads_calls == before, (
+                "request completion must not wake the periodic sampler"
+            )
             await channel.close()
         finally:
             holder.stop_event.set()
@@ -340,13 +341,10 @@ class TestServeGrpcCleanup:
         try:
             with pytest.raises(RuntimeError, match="startup boom"):
                 await grpc_server.serve_grpc(args)
-            rm = holder.request_manager
-            assert rm is not None
         finally:
             uninstall_fake_smg()
-        # Reporter cleaned up despite the failure: port freed, shadow removed.
+        # Reporter cleaned up despite the failure: port freed.
         assert port_is_free(port)
-        assert "generate_request" not in rm.__dict__
 
     @pytest.mark.asyncio
     async def test_cancellation_cleans_up_reporter(self, isolate_sidecar):
@@ -362,15 +360,12 @@ class TestServeGrpcCleanup:
                 await asyncio.sleep(0.02)
                 if holder.request_manager is not None and not port_is_free(port):
                     break
-            rm = holder.request_manager
-            assert rm is not None
             serve_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await serve_task
         finally:
             uninstall_fake_smg()
         assert port_is_free(port)
-        assert "generate_request" not in rm.__dict__
 
 
 if __name__ == "__main__":

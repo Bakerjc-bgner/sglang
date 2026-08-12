@@ -52,7 +52,6 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     ElasticScaleUpdateReq,
     FreezeGCReq,
-    LoadReporterRefreshIpcReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
     TokenizerWorkerRegistrationReq,
@@ -574,16 +573,10 @@ class MultiTokenizerRouter:
             self.load_snapshot_reader, range(self.server_args.dp_size)
         )
         future = asyncio.run_coroutine_threadsafe(
-            start_load_reporter(self.server_args, source, event_owner=None),
+            start_load_reporter(self.server_args, source),
             self._loop,
         )
         return _await_reporter_startup(future, self._loop, timeout=10.0)
-
-    def _handle_load_reporter_refresh(self, request: LoadReporterRefreshIpcReq) -> None:
-        """Forward a worker refresh hint to the router-owned reporter."""
-        if self._load_reporter_handle is None:
-            return
-        self._load_reporter_handle.notify_refresh()
 
     def _update_load_reporter_expected_ranks(self, effective_ep_size: int) -> None:
         """Update expected_dp_ranks after an elastic scale change.
@@ -638,10 +631,6 @@ class MultiTokenizerRouter:
                         f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
                         f"(total: {len(self.all_worker_ipcs)})"
                     )
-                continue
-
-            if isinstance(recv_obj, LoadReporterRefreshIpcReq):
-                self._handle_load_reporter_refresh(recv_obj)
                 continue
 
             if isinstance(

@@ -360,24 +360,20 @@ class LoadReporterRuntime:
         else:
             self._sampler.deactivate()
 
-    def notify_refresh(self) -> None:
-        """Synchronous, non-throwing refresh signal."""
-        try:
-            if not self._closing:
-                self._sampler.notify_refresh()
-        except Exception:
-            logger.exception("Load reporter notify_refresh failed")
-
-    def notify_source_changed(self) -> None:
-        """Signal that the snapshot source may have new data."""
-        self.notify_refresh()
-
     def update_expected_dp_ranks(self, expected_dp_ranks: Iterable[int]) -> bool:
-        """Update a rank-aware snapshot source after elastic scaling."""
+        """Update a rank-aware snapshot source after elastic scaling.
+
+        On a topology change, wake the sampler so the new rank set is
+        reflected without waiting for the next periodic tick.
+        """
         update = getattr(self._snapshot_source, "update_expected_dp_ranks", None)
         if update is None or not update(expected_dp_ranks):
             return False
-        self.notify_source_changed()
+        try:
+            if not self._closing:
+                self._sampler.notify_schedule_changed()
+        except Exception:
+            logger.exception("Load reporter topology-change wake failed")
         return True
 
     async def close(self) -> None:
