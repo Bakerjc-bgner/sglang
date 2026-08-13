@@ -10,7 +10,7 @@ from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-INITIAL_SAMPLE_TIMEOUT_SECONDS = 1.0
+SNAPSHOT_PULL_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
 SNAPSHOT_STALE_AFTER_MS = 3000
 
