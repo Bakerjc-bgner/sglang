@@ -224,8 +224,8 @@ class TestReporterEnabledWithCapability:
         assert port_is_free(port)
 
     @pytest.mark.asyncio
-    async def test_request_activity_does_not_wake_sampler(self, isolate_sidecar):
-        """Completing a request does not sample before the periodic deadline."""
+    async def test_request_activity_does_not_trigger_snapshot_pull(self, isolate_sidecar):
+        """Completing a request does not pull before the periodic deadline."""
         from sglang.srt.entrypoints import grpc_server
 
         port = free_port()
@@ -259,7 +259,7 @@ class TestReporterEnabledWithCapability:
             assert [item async for item in rm.generate_request()] == [0, 1, 2]
             await asyncio.sleep(0.1)
             assert rm.get_loads_calls == before, (
-                "request completion must not wake the periodic sampler"
+                "request completion must not trigger a snapshot pull"
             )
             await channel.close()
         finally:

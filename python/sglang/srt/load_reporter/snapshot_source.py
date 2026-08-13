@@ -1,8 +1,9 @@
-"""Load-snapshot source adapters.
+"""Load-snapshot source adapters for the load reporter.
 
-Temporary module name: the push-channel refactor removed the LoadSampler
-class, leaving only the source protocol and its two adapters.  This module
-is renamed to snapshot_source.py in the follow-up cleanup.
+The source protocol and its two adapters: the manager-side adapter reads
+through a shared-memory reader (or the manager's own get_loads RPC), and the
+Router-side adapter wraps a shared-memory reader with an authoritative
+DP-rank set that elastic scaling updates in place.
 """
 
 from __future__ import annotations

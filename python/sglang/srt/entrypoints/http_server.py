@@ -394,7 +394,7 @@ async def lifespan(fast_api_app: FastAPI):
     reporter_handle = None
     if server_args.load_reporter_port is not None:
         from sglang.srt.load_reporter import start_load_reporter
-        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+        from sglang.srt.load_reporter.snapshot_source import ManagerLoadSnapshotSource
 
         # Only the single-tokenizer process owns the reporter port and runtime.
         if single_tokenizer:

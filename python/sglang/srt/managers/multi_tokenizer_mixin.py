@@ -40,8 +40,8 @@ import zmq.asyncio
 from sglang.srt.disaggregation.utils import TransferBackend
 
 # IPC/exception types are lightweight and safe to import at module load time;
-# the gRPC-backed runtime and sampler remain lazy to preserve the optional
-# dependency boundary.
+# the gRPC-backed runtime and snapshot source remain lazy to preserve the
+# optional dependency boundary.
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -567,7 +567,7 @@ class MultiTokenizerRouter:
             return None
 
         from sglang.srt.load_reporter import start_load_reporter
-        from sglang.srt.load_reporter.sampler import RouterLoadSnapshotSource
+        from sglang.srt.load_reporter.snapshot_source import RouterLoadSnapshotSource
 
         source = RouterLoadSnapshotSource(
             self.load_snapshot_reader, range(self.server_args.dp_size)

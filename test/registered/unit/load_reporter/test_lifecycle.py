@@ -266,8 +266,8 @@ class TestOwnerPath:
             await asyncio.sleep(0.3)
             after = source.get_loads_calls
             assert after == before, (
-                "sampler must wait for the periodic deadline after its "
-                "initial sample"
+                "the fire loop must wait for the periodic deadline after its "
+                "initial report"
             )
             await channel.close()
         finally:
@@ -285,7 +285,7 @@ class TestHttpLifecycleAdapter:
         """HTTP single-tokenizer calls start_load_reporter directly; close()
         releases the listener port."""
         from sglang.srt.load_reporter.lifecycle import start_load_reporter
-        from sglang.srt.load_reporter.sampler import ManagerLoadSnapshotSource
+        from sglang.srt.load_reporter.snapshot_source import ManagerLoadSnapshotSource
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", 0))
