@@ -39,9 +39,6 @@ import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
 
-# IPC/exception types are lightweight and safe to import at module load time;
-# the gRPC-backed runtime and snapshot source remain lazy to preserve the
-# optional dependency boundary.
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
