@@ -11,11 +11,12 @@ Worker process.
 Transport direction: the **external Router dials INTO** the Worker's reporter
 port and drives a single bidirectional gRPC stream
 (`LoadMonitorService.Monitor`). The Router sends a `RegisterRequest` first; the
-Worker replies with an ack immediately, waits up to one second for the initial
-sampling attempt, and then sends the first `LoadReport`. A successful attempt
-therefore makes the first report a completed current snapshot; a hung attempt
-produces an explicit `UNREACHABLE` report after the bound. Periodic reports are
-then streamed on the negotiated interval, anchored from that first report.
+Worker replies with an ack immediately, then the reporter's fire loop performs
+one bounded snapshot pull and sends the first `LoadReport`. A successful pull
+therefore makes the first report a completed current snapshot; a hung or
+invalid pull produces an explicit `UNREACHABLE` report after the bound.
+Periodic reports are then broadcast on the negotiated deadlines, anchored from
+that first report.
 
 The reporter is **opt-in and disabled by default**. When `--load-reporter-port`
 is unset there is zero overhead: no socket, no task, no binding, and the
@@ -31,33 +32,53 @@ optional `grpc`/`protobuf` stack is never imported.
 
 ## Serving-mode matrix
 
-Every mode shares one reporter service / runtime / proto / sampler. Only the
-startup site and the snapshot source differ.
+Every mode shares one reporter service / runtime / proto / snapshot source.
+Only the startup site and the snapshot source differ.
 
-| Serving mode | Reporter start site | Snapshot source | Sampling |
+| Serving mode | Reporter start site | Snapshot source | Snapshot fires |
 |---|---|---|---|
-| HTTP | FastAPI `lifespan` | `TokenizerManager` | initial + periodic |
-| native gRPC (`--grpc-port`) | reuses the same FastAPI lifespan (no second listener) | `TokenizerManager` | initial + periodic |
-| multi-tokenizer HTTP (`--tokenizer-worker-num > 1`) | sole `MultiTokenizerRouter` owns the port | Router shared-memory snapshot reader | initial + periodic |
-| standalone SMG RPC (`--smg-grpc-mode`) | `grpc_server.py::_on_request_manager_ready` (`start_load_reporter`) | `GrpcRequestManager.get_loads(include=["core"])` | initial + periodic |
+| HTTP | FastAPI `lifespan` | `TokenizerManager` | registration + negotiated deadlines |
+| native gRPC (`--grpc-port`) | reuses the same FastAPI lifespan (no second listener) | `TokenizerManager` | registration + negotiated deadlines |
+| multi-tokenizer HTTP (`--tokenizer-worker-num > 1`) | sole `MultiTokenizerRouter` owns the port | Router shared-memory snapshot reader | registration + negotiated deadlines |
+| standalone SMG RPC (`--smg-grpc-mode`) | `grpc_server.py::_on_request_manager_ready` (`start_load_reporter`) | `GrpcRequestManager.get_loads(include=["core"])` | registration + negotiated deadlines |
 
 > **Multi-tokenizer native gRPC is not supported.** `ServerArgs` rejects
 > `--grpc-port` together with `--tokenizer-worker-num > 1`, so the reporter does
 > not claim that combination. Multi-tokenizer applies to HTTP only.
 
-**All serving modes use request-independent sampling.** The first Router
-registration triggers an initial sample; subsequent sampling follows the
-shortest active report interval across registered Router sessions. Request
-dispatch, completion, and abort events have no edge into the sampling graph.
-Topology and reporter-lifecycle changes may reschedule or wake the sampler as
-described below, and the sampler deactivates when the last session is removed.
+**All serving modes use request-independent snapshot fires.** The reporter owns
+exactly one timer: it wakes at the earliest report deadline (or lease expiry)
+across registered Router sessions, performs one bounded pull, and broadcasts
+the resulting report to every session whose deadline has fired. Request
+dispatch, completion, and abort events have no edge into this graph. Topology
+changes only update the expected DP-rank set; the next fire observes it.
+
+## Push-channel semantics
+
+- **One timer.** `LoadReporterRuntime` owns a single fire-loop task. Sessions
+  are passive bookkeeping (deadline, lease, queue); they own no task and no
+  timer.
+- **One pull per fire.** Each fire reads the Scheduler snapshot exactly once
+  (with one bounded retry when the expected DP-rank set changed mid-pull) and
+  builds exactly one report.
+- **Broadcast to due sessions.** Every session whose deadline has fired at the
+  fire receives the same report simultaneously. When all Routers negotiate the
+  same interval, every fire broadcasts to every registered Router — a pure push
+  channel anchored by the first registration. When sessions differ, each still
+  receives only at its own negotiated deadline while the shared pull runs at
+  the union of deadlines.
+- **Coalesced registration.** Sessions registered before the next fire share
+  that fire's pull for their initial report.
+- **No persistent store.** There is no latest-snapshot store and no
+  cross-report merge: a report contains only the ranks returned by its own
+  pull attempt.
 
 ## Freshness model
 
 End-to-end snapshot freshness is bounded by the Scheduler snapshot publication
 path (`load_snapshot_publish_interval`), not by the gRPC delivery cadence.
 The report interval controls how often a report is sent; it does not control
-how old the snapshot data inside that report is. A poll at the same cadence
+how old the snapshot data inside that report is. A pull at the same cadence
 can observe data of the same age because both consume the same
 Scheduler-published snapshots.
 
@@ -68,7 +89,7 @@ What the push stream provides over polling:
 - **Connection reuse.** One persistent bidirectional gRPC stream per Router
   session, not per-request connections.
 - **Multi-Router fan-out.** Multiple Routers can register independently; the
-  sampler shares one active cadence (the minimum across sessions).
+  fire loop shares one pull per deadline across all due sessions.
 - **Leases.** Each session has a TTL; the Worker stops reporting when the
   lease expires, preventing stranded streams.
 - **Bounded backpressure.** Each session queue is capacity-1, latest-wins;
@@ -78,23 +99,25 @@ What the push stream provides over polling:
 
 ```text
 Scheduler
-  -> existing SHM/ZMQ LoadSnapshot publication
-  -> reporter-owner LoadSampler at the shortest active report interval
-  -> LatestSnapshotStore
-  -> each Router session at its negotiated deadline
-  -> capacity-one queue
-  -> bidirectional gRPC stream
+  -> existing SHM/ZMQ latest LoadSnapshot publication
+  -> reporter single fire timer (min next deadline across Router sessions)
+  -> one bounded snapshot_source.get_loads() per fire
+  -> validate this pull's complete DP-rank set (one retry on rank-set change)
+  -> build one LoadReport per fire (no previous-report merge)
+  -> broadcast to every session due at this fire (capacity-one queues)
+  -> bidirectional gRPC streams
 ```
 
 Request execution has no edge into this graph. Starting, completing, aborting,
-or cancelling a request neither samples data nor changes a report deadline.
+or cancelling a request neither pulls snapshot data nor changes a report
+deadline.
 
-Non-request control-plane events may still wake internal tasks when required
+Non-request control-plane events may still wake the fire loop when required
 for correct lifecycle behavior:
 
-- activating or deactivating the sampler as sessions appear or disappear;
-- applying an interval update so timers use the new schedule;
-- changing the expected DP rank set after elastic scaling;
+- registering or replacing a session;
+- applying an interval or lease update so the timer uses the new schedule;
+- changing the expected DP rank set after elastic scaling (no immediate pull);
 - shutting down the reporter.
 
 These events are bounded by reporter/session lifecycle changes rather than
@@ -118,8 +141,8 @@ reporter-internal type leaks into them.
 gRPC server, close the runtime.
 
 `LoadReporterHandle.update_expected_dp_ranks()` propagates elastic topology
-changes to the snapshot source and wakes the sampler so the new rank set is
-reflected without waiting for the next periodic tick.
+changes to the snapshot source. It does not pull; the next fire observes the
+new rank set.
 
 ## Network and deployment model
 
@@ -161,8 +184,8 @@ service LoadMonitorService {
   Worker accepts the frame. Invalid input terminates the stream with
   `StreamError(code="INVALID_ARGUMENT")`.
 - `WorkerFrame` = `registered | report | error`. On valid register the Worker
-  sends the ack immediately, then a bounded sampled-first report, followed by
-  periodic `LoadReport`s.
+  sends the ack immediately, then a bounded first-fire report, followed by
+  periodic `LoadReport`s on the negotiated deadline.
 - Same `router_id` re-registering on a new stream replaces the old session;
   different `router_id`s coexist. Each session's response queue is capacity-1,
   latest-wins, so a slow Router never accumulates historical reports.
@@ -172,24 +195,35 @@ service LoadMonitorService {
   associate a report with the Worker identity of the outbound task, not trust
   `worker_addr`.
 
-**Report status:** `HEALTHY` when every rank satisfies
-`report_time - snapshot_time <= load_reporter_snapshot_stale_after_ms`; `STALE`
-when at least one rank exceeds it (ranks still included); `UNREACHABLE` when the
-store has never completed a full snapshot.
+**Report status** describes the single attempt that produced the report:
+
+- `HEALTHY`: this attempt returned a complete valid rank set and every rank
+  timestamp is within the stale threshold.
+- `STALE`: this attempt returned a complete valid rank set but at least one
+  rank timestamp is older than the threshold; ranks are still included.
+- `UNREACHABLE`: this attempt timed out, raised, decoded invalid data, or
+  returned an incomplete rank set; ranks are empty and `last_error` explains
+  the attempt failure. No historical ranks are substituted.
+
+A rank timestamp that regresses is forwarded and evaluated as stale — it is
+never replaced with historical data. A rank whose Scheduler timestamp is
+absent or non-positive is reported with the pull-completion wall clock and
+therefore evaluates as fresh; freshness claims are only as strong as the
+published timestamp.
 
 ## Configuration
 
 | `ServerArgs` field | Default | Description |
 |---|---|---|
 | `load_reporter_port` | `None` | Fixed port for the Worker reporter gRPC service. `None` fully disables the reporter (no socket/task/binding). Valid range `1..65535`. |
-| `load_reporter_snapshot_stale_after_ms` | `3000` | Emit `REPORT_STATUS_STALE` past this age. |
-| `load_reporter_zone` | `None` | Optional zone metadata; empty string normalized to `None`. |
+
+Reporter-internal constants live in `config.py` and are intentionally not CLI
+arguments: the stale threshold (`SNAPSHOT_STALE_AFTER_MS`, default `3000`), the
+per-fire pull bound (`SNAPSHOT_PULL_TIMEOUT_SECONDS`), and the shutdown bound
+(`SHUTDOWN_TIMEOUT_SECONDS`).
 
 The external Router's paired reporter-port configuration is a delivery contract
 only; its parameter name is chosen by the Router owner and is not defined here.
-
-Reporter-internal lifecycle constants live in `config.py` and are intentionally
-not CLI arguments.
 
 ## Module layout
 
@@ -197,10 +231,10 @@ not CLI arguments.
 |---|---|
 | `lifecycle.py` | Composition root (`start_load_reporter`) and `LoadReporterHandle`. |
 | `service.py` | `LoadMonitorService.Monitor` bidi handler (depends only on runtime + proto). |
-| `runtime.py` | `LoadReporterRuntime`: inbound Router session table, sampler wiring, bounded shutdown. |
-| `sampler.py` | `LoadSampler` single-flight loop; `ManagerLoadSnapshotSource` / `RouterLoadSnapshotSource`. |
-| `store.py` | `LatestSnapshotStore` latest-wins view. |
-| `report_builder.py` | `SnapshotView` → `pb.LoadReport` with status + sequence id. |
+| `runtime.py` | `LoadReporterRuntime`: session table, the single fire loop, bounded shutdown. |
+| `snapshot_source.py` | `LoadSnapshotSource` protocol; `ManagerLoadSnapshotSource` / `RouterLoadSnapshotSource` adapters. |
+| `snapshot_validation.py` | Stateless one-pull validation (`validate_full_snapshot`). |
+| `report_builder.py` | Validated rank tuple → `pb.LoadReport` with status + sequence id. |
 | `config.py` | `LoadReporterConfig` / `WorkerMetadata` from `ServerArgs`; internal constants. |
 | `proto/` | Generated `sglang.router.loadmonitor.v1` bindings. |
 
@@ -208,29 +242,32 @@ not CLI arguments.
 
 - Reporter components use the serving loop owned by HTTP, the
   `MultiTokenizerRouter`, or standalone SMG RPC.
-- Single-flight sampler: at most one `get_loads()` in flight; the sampler
-  activates on first registration and deactivates when no sessions remain.
-- Sampling, connection, write, and shutdown failures never propagate into
-  inference requests.
+- Single fire loop: at most one `get_loads()` in flight; the loop idles when
+  no sessions remain and starts with the first registration.
+- Pull, connection, write, and shutdown failures never propagate into
+  inference requests. Shutdown cancels the fire task directly, so an in-flight
+  pull is aborted immediately.
 
 ## Tests and validation
 
 - Unit / integration (CPU, real in-process `grpc.aio`): proto contract, runtime
-  sessions (initial report, periodic sampling, minimum interval selection,
-  interval rescheduling, stale/error reports, in-flight samples,
-  re-registration, leases, shutdown), service handshake/reporting,
+  fire loop (coalesced initial broadcast, shared periodic broadcast, per-session
+  deadline gating, pull retry on rank-set change, interval re-anchoring,
+  stale/error reports, in-flight pulls, re-registration, leases, shutdown),
+  validation and report-builder contracts, service handshake/reporting,
   composition-root lifecycle (disabled, owner startup, cleanup, port conflicts,
   expected-rank updates), and standalone SMG wiring (capability guard,
   `_serve_grpc` failure/exit/cancel cleanup) via a faked `_serve_grpc` import
   boundary (no smg install required).
 - Negative invariant tests verify that request activity does not trigger
-  sampling.
-- Topology-change tests verify that `update_expected_dp_ranks` wakes the
-  sampler with a topology-specific path (no generic request refresh API).
+  snapshot pulls.
+- Topology-change tests verify that `update_expected_dp_ranks` updates the
+  expected rank set without an immediate pull and that the next fire observes
+  the new set.
 - E2E (GPU + model, CUDA CI) under `test/registered/tokenizer/`: a real
   `grpc.aio` fake Router dials in and verifies that periodic reports continue
   through inference activity. The standalone SMG test verifies coexistence of
-  inference and reporting without a request-end wake path.
+  inference and reporting without a request-end pull path.
 
 ## Known limitations
 
@@ -241,6 +278,9 @@ not CLI arguments.
 - The gRPC report interval controls delivery cadence; end-to-end snapshot
   freshness is bounded by the Scheduler's snapshot publication interval
   (`load_snapshot_publish_interval`), not by the gRPC delivery cadence.
+- A topology update concurrent with a pull can make that one attempt fail
+  (`UNREACHABLE`); the next fire self-heals. Publication ordering with the
+  expected-rank-set update is Scheduler-side and not coordinated here.
 - The external Router client (discovery, retry, registry reconciliation,
   load-aware policy) is a separate prerequisite; until it ships, keep the
   reporter disabled and do not claim end-to-end load-aware routing.

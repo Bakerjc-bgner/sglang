@@ -2,8 +2,8 @@
 
 Converts one pull's validated rank tuple into a pb.LoadReport proto, applying
 staleness logic and assigning monotonically increasing sequence IDs.  A report
-contains only the ranks supplied for that attempt — there is no persistent
-last-good state to fall back to.
+contains only the ranks supplied for that attempt — no rank is ever
+substituted from an earlier report.
 """
 
 from __future__ import annotations

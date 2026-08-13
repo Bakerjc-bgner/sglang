@@ -182,8 +182,9 @@ class TestLoadReporterStandaloneGrpc(CustomTestCase):
     def test_inference_and_reporting_coexist(self) -> None:
         """Inference and periodic reporting run independently.
 
-        Sampling is periodic — request completion does not wake the sampler.
-        The reporter stream stays healthy through inference activity.
+        Reports fire on the negotiated deadline — request completion does not
+        trigger a snapshot pull.  The reporter stream stays healthy through
+        inference activity.
         """
         self.assertTrue(
             self.reporter_up, "standalone reporter port never started listening"

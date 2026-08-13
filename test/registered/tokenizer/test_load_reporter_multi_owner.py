@@ -1,9 +1,9 @@
 """E2E: multi-tokenizer load reporter ownership boundary.
 
 With ``--tokenizer-worker-num > 1`` only the sole ``MultiTokenizerRouter`` binds
-``--load-reporter-port`` and owns the shared periodic sampler. A real
-``grpc.aio`` fake Router dials in and must see one working stream. Periodic
-reports continue while requests are spread across the HTTP workers; no
+``--load-reporter-port`` and owns the shared fire loop. A real ``grpc.aio``
+fake Router dials in and must see one working stream. Periodic reports
+continue while requests are spread across the HTTP workers; no
 request-driven reporter IPC is involved.
 
 Requires a GPU + model + the load-reporter grpc/protobuf extra (CUDA CI).
@@ -168,10 +168,10 @@ class TestLoadReporterMultiOwner(CustomTestCase):
             )
             self.assertTrue(
                 router.wait_for_reports(2),
-                "router-owned periodic sampler produced fewer than 2 reports",
+                "router-owned fire loop produced fewer than 2 reports",
             )
             # Spread several requests across the 2 HTTP workers. Request
-            # activity is independent of the router-owned periodic sampler.
+            # activity is independent of the router-owned fire loop.
             for i in range(6):
                 resp = requests.post(
                     f"{self.base_url}/generate",
@@ -189,7 +189,7 @@ class TestLoadReporterMultiOwner(CustomTestCase):
             )
             self.assertTrue(
                 router.wait_for_ranked_report(),
-                "shared periodic sampler produced no ranked report",
+                "shared fire loop produced no ranked report",
             )
         finally:
             router.stop()
