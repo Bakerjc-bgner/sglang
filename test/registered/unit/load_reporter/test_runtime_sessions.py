@@ -346,6 +346,37 @@ class TestFireLoop:
             await rt.close()
 
     @pytest.mark.asyncio
+    async def test_periodic_cadence_anchored_at_registration(self):
+        """The schedule is anchored at registration, not at first-report completion.
+
+        Pins the R4 scheduling contract: with the first pull held for 200ms of
+        a 500ms interval, the second fire still starts ~500ms after
+        registration; a first-report-anchored schedule would start it ~700ms.
+        """
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = ControlledSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            registered_at = time.monotonic()
+            rt.register_session("r1", 500, 30000)
+
+            # Hold the first pull for 200ms (< interval), then let it finish.
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            source.started.clear()
+            await asyncio.sleep(0.2)
+            source.release.set()
+
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            elapsed = time.monotonic() - registered_at
+            assert (
+                0.42 <= elapsed < 0.62
+            ), f"fire 2 started {elapsed:.3f}s after registration"
+        finally:
+            source.release.set()
+            await rt.close()
+
+    @pytest.mark.asyncio
     async def test_reports_flow_periodically(self):
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 

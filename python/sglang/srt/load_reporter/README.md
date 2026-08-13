@@ -15,8 +15,8 @@ Worker replies with an ack immediately, then the reporter's fire loop performs
 one bounded snapshot pull and sends the first `LoadReport`. A successful pull
 therefore makes the first report a completed current snapshot; a hung or
 invalid pull produces an explicit `UNREACHABLE` report after the bound.
-Periodic reports are then broadcast on the negotiated deadlines, anchored from
-that first report.
+Periodic reports are then broadcast on the negotiated deadlines, anchored at
+each session's registration time (not at first-report completion).
 
 The reporter is **opt-in and disabled by default**. When `--load-reporter-port`
 is unset there is zero overhead: no socket, no task, no binding, and the
