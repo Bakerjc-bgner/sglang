@@ -1,13 +1,13 @@
-"""Single-flight load sampler with coalesced refreshes."""
+"""Load-snapshot source adapters.
+
+Temporary module name: the push-channel refactor removed the LoadSampler
+class, leaving only the source protocol and its two adapters.  This module
+is renamed to snapshot_source.py in the follow-up cleanup.
+"""
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import time
-from typing import Any, Callable, Collection, Optional, Protocol, runtime_checkable
-
-logger = logging.getLogger(__name__)
+from typing import Any, Collection, Optional, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -79,156 +79,3 @@ class RouterLoadSnapshotSource:
             return False
         self._expected = updated
         return True
-
-
-class LoadSampler:
-    """Background sampler that coalesces refresh requests."""
-
-    def __init__(
-        self,
-        snapshot_source: Any,
-        store: Any,
-        interval_provider: Callable[[], Optional[int]],
-        on_sample_completed: Optional[Callable[[], None]] = None,
-    ) -> None:
-        """Initialize the coalescing sampler."""
-        self._snapshot_source = snapshot_source
-        self._store = store
-        self._interval_provider = interval_provider
-        self._on_sample_completed = on_sample_completed
-
-        self._wake: asyncio.Event = asyncio.Event()
-        self._active: bool = False
-        self._closing: bool = False
-        self._task: Optional[asyncio.Task[None]] = None
-
-    def activate(self) -> None:
-        """Activate the sampler and start its task if needed."""
-        if self._closing:
-            return
-        self._active = True
-        if self._task is None:
-            self._task = asyncio.create_task(self._run(), name="load-reporter-sampler")
-        self._wake.set()
-
-    def deactivate(self) -> None:
-        """Deactivate sampling while leaving the background task reusable."""
-        if self._closing:
-            return
-        self._active = False
-        self._wake.set()
-
-    def notify_schedule_changed(self) -> None:
-        """Wake the loop to recompute its timer interval."""
-        if self._active and not self._closing:
-            self._wake.set()
-
-    async def close(self) -> None:
-        """Shut down the background task gracefully."""
-        self._active = False
-        self._closing = True
-        self._wake.set()
-        task = self._task
-        if task is None:
-            return
-
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Load reporter sampler task raised: %s", exc)
-        finally:
-            if task.done() and self._task is task:
-                self._task = None
-
-    def cancel(self) -> None:
-        """Request immediate cancellation of the sampler task."""
-        self._active = False
-        self._closing = True
-        self._wake.set()
-        if self._task is not None:
-            self._task.cancel()
-
-    async def wait_stopped(self) -> None:
-        """Join a cancelled sampler task without propagating its result."""
-        task = self._task
-        if task is None:
-            return
-
-        try:
-            result = (await asyncio.gather(task, return_exceptions=True))[0]
-            if isinstance(result, Exception):
-                logger.warning("Load reporter sampler task raised: %s", result)
-        finally:
-            if task.done() and self._task is task:
-                self._task = None
-
-    async def _refresh_once(self) -> None:
-        """Execute one full sample cycle and write the result into the store."""
-        try:
-            loads = await self._snapshot_source.get_loads()
-            completed_unix_ms = time.time_ns() // 1_000_000
-            completed_monotonic = time.monotonic()
-            self._store.apply_full_snapshot(
-                loads,
-                expected_dp_ranks=self._snapshot_source.expected_dp_ranks(),
-                collected_at_unix_ms=completed_unix_ms,
-                collected_at_monotonic=completed_monotonic,
-            )
-        except Exception as exc:
-            self._store.record_error(exc)
-            logger.warning("Load reporter sampling failed: %s", exc)
-        finally:
-            if self._on_sample_completed is not None:
-                try:
-                    self._on_sample_completed()
-                except Exception:
-                    logger.exception("Load reporter sample callback failed")
-
-    async def _run(self) -> None:
-        """Run the single-flight refresh loop."""
-        while not self._closing:
-            if not self._active:
-                # Clear a stale deactivation wake before waiting. Re-check the
-                # state to avoid losing an activation racing with ``clear()``.
-                self._wake.clear()
-                if not self._active and not self._closing:
-                    await self._wake.wait()
-                continue
-
-            # ---- wait for a trigger or timer ----
-            interval_ms = self._interval_provider()
-            if interval_ms is not None and interval_ms > 0:
-                interval_sec: Optional[float] = interval_ms / 1000.0
-            else:
-                interval_sec = None  # wait indefinitely on wake only
-
-            if not self._wake.is_set():
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=interval_sec)
-                    # wake fired (not a timeout)
-                except asyncio.TimeoutError:
-                    # Timer expired — proceed to refresh
-                    pass
-
-            if self._closing:
-                break
-            if not self._active:
-                continue
-
-            # ---- single refresh (coalescing loop) ----
-            # Clear BEFORE the refresh so notifications during it re-set.
-            self._wake.clear()
-            await self._refresh_once()
-
-            if self._closing:
-                break
-            if not self._active:
-                continue
-
-            # If a notification arrived during the refresh the event will
-            # be set again.  Drain it with exactly one follow-up refresh.
-            if self._wake.is_set():
-                self._wake.clear()
-                await self._refresh_once()
