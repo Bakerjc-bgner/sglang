@@ -119,10 +119,6 @@ class _RouterSession:
         except asyncio.QueueFull:
             pass  # consumed between check and put — skip
 
-    def _remaining_lease_seconds(self) -> float:
-        """Seconds until this session's lease expires (never negative)."""
-        return max(0.0, self._lease_expires_at - time.monotonic())
-
     def _advance_deadline(self, now: float) -> None:
         """Move the deadline forward one interval; re-anchor when behind."""
         interval_sec = self._report_interval_ms / 1000.0
@@ -280,11 +276,8 @@ class LoadReporterRuntime:
                 if not due:
                     continue  # fired for lease expiry; the loop reaps them
 
-                timeout = min(
-                    SNAPSHOT_PULL_TIMEOUT_SECONDS,
-                    min(s._remaining_lease_seconds() for s in due),
-                )
-                report = await self._pull_report(max(0.001, timeout))
+                # Pull with the source-level budget; leases only gate delivery.
+                report = await self._pull_report(SNAPSHOT_PULL_TIMEOUT_SECONDS)
                 if self._closing:
                     break
 

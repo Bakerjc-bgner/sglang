@@ -550,6 +550,51 @@ class TestUpdateConfig:
 
 class TestLeaseExpiry:
     @pytest.mark.asyncio
+    async def test_expiring_session_does_not_shrink_shared_pull_timeout(self):
+        """R1 regression: a short lease must not bound a shared fire's pull.
+
+        Pre-fix, the shared pull timeout was the shortest remaining lease of
+        due sessions, so an expiring session made the pull time out and the
+        healthy session sharing the deadline received UNREACHABLE.
+        """
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        source = ControlledSnapshotSource()
+        rt = LoadReporterRuntime(source, make_server_args())
+        try:
+            _, expiring = rt.register_session("expiring", 60, 80)
+            _, healthy = rt.register_session("healthy", 60, 3000)
+
+            # Fire 1: release the initial pull immediately.
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            source.started.clear()
+            source.release.set()
+            first = await asyncio.wait_for(healthy.queue.get(), timeout=1.0)
+            assert first.status == pb.REPORT_STATUS_HEALTHY
+            source.release.clear()  # arm the gate before fire 2's pull awaits it
+
+            # Fire 2: hold the pull past the expiring session's 80ms lease.
+            await asyncio.wait_for(source.started.wait(), timeout=1.0)
+            source.started.clear()
+            await asyncio.sleep(0.05)
+            source.release.set()
+
+            # The healthy session shares the deadline and must still receive
+            # the completed pull's report instead of a lease-shortened timeout.
+            second = await asyncio.wait_for(healthy.queue.get(), timeout=1.0)
+            assert second.status == pb.REPORT_STATUS_HEALTHY
+
+            # The expiring session is reaped once its lease ends.
+            sentinel = await asyncio.wait_for(expiring.queue.get(), timeout=1.0)
+            if sentinel is not None:
+                sentinel = await asyncio.wait_for(expiring.queue.get(), timeout=1.0)
+            assert sentinel is None
+        finally:
+            source.release.set()
+            await rt.close()
+
+    @pytest.mark.asyncio
     async def test_keepalive_does_not_publish_before_report_deadline(self):
         """Lease renewals must not accelerate the periodic report cadence."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
