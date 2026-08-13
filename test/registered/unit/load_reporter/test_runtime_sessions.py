@@ -135,6 +135,27 @@ class ScriptedSnapshotSource:
         return frozenset(range(self._dp_size))
 
 
+class DelayedScriptedSnapshotSource:
+    """Return one scripted result (or raise it) after a fixed delay per call."""
+
+    def __init__(self, script: list, delay: float, dp_size: int = 1) -> None:
+        self._script = list(script)
+        self._delay = delay
+        self.get_loads_calls = 0
+        self._dp_size = dp_size
+
+    async def get_loads(self) -> list:
+        self.get_loads_calls += 1
+        await asyncio.sleep(self._delay)
+        step = self._script[min(self.get_loads_calls, len(self._script)) - 1]
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    def expected_dp_ranks(self) -> frozenset:
+        return frozenset(range(self._dp_size))
+
+
 async def drain_queue(q: asyncio.Queue, count: int, timeout: float = 2.0) -> list:
     """Drain up to count non-None items from q within timeout seconds."""
     items = []
@@ -378,6 +399,39 @@ class TestFireLoop:
             assert report.status == pb.REPORT_STATUS_HEALTHY
             assert [r.dp_rank for r in report.ranks] == [0, 1]
             assert source.get_loads_calls == 2  # initial attempt + one retry
+        finally:
+            await rt.close()
+
+    @pytest.mark.asyncio
+    async def test_rank_set_retry_uses_remaining_budget(self, monkeypatch):
+        """R3 regression: the rank-set retry must share the fire's timeout budget.
+
+        Pre-fix, each attempt got the full budget, so two 0.12s attempts fit
+        inside 0.2s; post-fix, the second attempt only gets the remainder and
+        its 0.12s delay times out.
+        """
+        import sglang.srt.load_reporter.runtime as runtime_module
+        from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
+        from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+
+        monkeypatch.setattr(runtime_module, "SNAPSHOT_PULL_TIMEOUT_SECONDS", 0.2)
+        source = DelayedScriptedSnapshotSource(
+            script=[
+                [make_load_snapshot(1)],  # missing rank 1 -> retryable mismatch
+                [make_load_snapshot(1), make_load_snapshot(1, dp_rank=1)],
+            ],
+            delay=0.12,
+            dp_size=2,
+        )
+        rt = LoadReporterRuntime(source, make_server_args(dp_size=2))
+        started_at = time.monotonic()
+        try:
+            _, session = rt.register_session("r1", 5000, 30000)
+            report = await asyncio.wait_for(session.queue.get(), timeout=0.5)
+
+            assert report.status == pb.REPORT_STATUS_UNREACHABLE
+            assert source.get_loads_calls == 2  # retry ran with the remainder
+            assert time.monotonic() - started_at < 0.35  # not 2x the budget
         finally:
             await rt.close()
 

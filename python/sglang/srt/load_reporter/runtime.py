@@ -205,11 +205,16 @@ class LoadReporterRuntime:
     async def _pull_report(self, timeout_seconds: float) -> pb.LoadReport:
         """Pull once (retrying one rank-set change), build one report."""
         report_time_unix_ms = time.time_ns() // 1_000_000
+        # One fire budget shared by the initial attempt and its one retry.
+        deadline = time.monotonic() + timeout_seconds
         try:
             for attempt in (1, 2):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
                 try:
                     loads = await asyncio.wait_for(
-                        self._snapshot_source.get_loads(), timeout=timeout_seconds
+                        self._snapshot_source.get_loads(), timeout=remaining
                     )
                     report_time_unix_ms = time.time_ns() // 1_000_000
                     ranks = validate_full_snapshot(
