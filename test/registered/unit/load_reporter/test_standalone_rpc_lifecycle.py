@@ -1,13 +1,4 @@
-"""Standalone SMG RPC reporter integration in ``grpc_server.serve_grpc``.
-
-The external ``smg-grpc-servicer`` package is NOT required: these tests inject a
-fake ``_serve_grpc`` at the existing import boundary
-(``smg_grpc_servicer.sglang.server.serve_grpc``) and monkeypatch the sidecar
-helpers.  They verify that SGLang starts the reporter with a manager-backed
-snapshot source (no generate_request shadow), guarded by the
-``inspect.signature`` capability check, and cleaned up on normal exit /
-failure / cancellation.
-"""
+"""Standalone SMG RPC reporter integration in ``grpc_server.serve_grpc``."""
 
 from __future__ import annotations
 
@@ -52,8 +43,7 @@ def make_server_args(
 
 
 class FakeRequestManager:
-    """Stand-in for smg's GrpcRequestManager: exposes server_args, get_loads,
-    and an async-generator generate_request (undecorated in the class body)."""
+    """Stand-in for smg's GrpcRequestManager (server_args, get_loads, generate_request)."""
 
     def __init__(self, server_args: Any) -> None:
         self.server_args = server_args
@@ -85,12 +75,7 @@ def port_is_free(port: int) -> bool:
 
 
 def install_fake_smg(capability: bool):
-    """Inject a fake smg_grpc_servicer.sglang.server module.
-
-    Returns a holder whose ``.serve`` is the fake ``_serve_grpc``.  When
-    ``capability`` is True the fake accepts ``on_request_manager_ready`` (so the
-    inspect.signature check passes); otherwise it does not.
-    """
+    """Inject a fake smg_grpc_servicer.sglang.server module."""
     holder = types.SimpleNamespace(
         request_manager=None,
         stop_event=None,  # set per-test to control server lifetime

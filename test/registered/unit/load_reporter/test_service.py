@@ -1,10 +1,4 @@
-"""Integration tests for LoadMonitorService using a real grpc.aio in-process server.
-
-The Worker is the gRPC server; the fake Router is the gRPC client.
-Tests cover: normal handshake, periodic reporting (no request activity),
-illegal first frame, client cancel, server shutdown, same-router_id
-stream replacement, and the fixed-port-occupied failure path.
-"""
+"""Integration tests for LoadMonitorService using a real grpc.aio in-process server."""
 
 from __future__ import annotations
 

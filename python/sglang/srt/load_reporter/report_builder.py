@@ -1,10 +1,4 @@
-"""Pure report builder for the embedded load reporter.
-
-Converts one pull's validated rank tuple into a pb.LoadReport proto, applying
-staleness logic and assigning monotonically increasing sequence IDs.  A report
-contains only the ranks supplied for that attempt — no rank is ever
-substituted from an earlier report.
-"""
+"""Pure report builder for the embedded load reporter."""
 
 from __future__ import annotations
 

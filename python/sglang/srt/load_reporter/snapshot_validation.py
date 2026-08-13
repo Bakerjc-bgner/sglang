@@ -1,9 +1,4 @@
-"""Stateless single-pull snapshot validation.
-
-Validates one pull's worth of scheduler load snapshots against the expected
-DP-rank set, without any reference to previous pulls or stored state.  The
-result is a frozen, rank-sorted tuple of core metrics.
-"""
+"""Stateless single-pull snapshot validation."""
 
 from __future__ import annotations
 
@@ -70,12 +65,7 @@ class SnapshotValidationError(ValueError):
 
 
 class RankSetMismatchError(SnapshotValidationError):
-    """The pull's DP-rank set does not match the expected set.
-
-    Duplicate, missing, or unexpected ranks.  Unlike invalid field values,
-    a mismatch may be transient (a topology update landing mid-pull), so the
-    runtime treats it as retryable.
-    """
+    """Duplicate, missing, or unexpected ranks (retryable, unlike field errors)."""
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +168,7 @@ def validate_full_snapshot(
     expected_dp_ranks: Collection[int],
     fallback_time_unix_ms: int,
 ) -> tuple[RankSnapshot, ...]:
-    """Validate one pull's snapshots and return a rank-sorted frozen tuple.
-
-    Stateless by design: no previous pull, stored rank, or historical
-    timestamp influences the result.  A timestamp regression is forwarded
-    as-is; the caller decides how to report it.
-    """
+    """Validate one pull's snapshots and return a rank-sorted frozen tuple."""
     fallback_time_unix_ms = _require_non_negative_int64(
         "fallback_time_unix_ms", fallback_time_unix_ms
     )

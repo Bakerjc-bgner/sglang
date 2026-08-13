@@ -1,11 +1,4 @@
-"""Unit tests for stateless LoadReport construction.
-
-These tests pin the report contract: a report contains only the ranks
-supplied for that attempt (no cross-report substitution), staleness is
-computed from those ranks against the report wall clock, sequence IDs are
-shared, positive, and monotonically increasing across both build paths, and
-an unreachable report carries no ranks plus a normalized diagnostic.
-"""
+"""Unit tests for stateless LoadReport construction."""
 
 from __future__ import annotations
 

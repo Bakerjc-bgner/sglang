@@ -1,10 +1,4 @@
-"""Load-snapshot source adapters for the load reporter.
-
-The source protocol and its two adapters: the manager-side adapter reads
-through a shared-memory reader (or the manager's own get_loads RPC), and the
-Router-side adapter wraps a shared-memory reader with an authoritative
-DP-rank set that elastic scaling updates in place.
-"""
+"""Load-snapshot source protocol and the manager/Router adapters."""
 
 from __future__ import annotations
 

@@ -1,12 +1,4 @@
-"""Unit tests for stateless full-snapshot validation.
-
-These tests pin the one-attempt contract: validation reads only the supplied
-snapshot list, the expected DP-rank set, and a fallback timestamp — never any
-prior pull. A timestamp regression is therefore forwarded as-is instead of
-being substituted with historical data, and rank-set failures are
-distinguishable from invalid field values so the runtime can retry only
-self-healing failures.
-"""
+"""Unit tests for stateless full-snapshot validation."""
 
 from __future__ import annotations
 

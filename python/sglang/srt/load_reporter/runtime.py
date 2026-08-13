@@ -36,12 +36,7 @@ def _validate_timing(
 
 
 class _RouterSession:
-    """One inbound Router stream: passive bookkeeping plus a response queue.
-
-    The session owns no task and no timer.  The runtime's fire loop advances
-    its deadline and enqueues reports; the gRPC service thread updates its
-    config and lease from inbound control frames.
-    """
+    """One inbound Router stream: passive bookkeeping plus a response queue."""
 
     def __init__(
         self,
@@ -203,23 +198,12 @@ class LoadReporterRuntime:
             del self._sessions[router_id]
 
     def update_expected_dp_ranks(self, expected_dp_ranks: Iterable[int]) -> bool:
-        """Update a rank-aware snapshot source after elastic scaling.
-
-        A topology change only updates the expected rank set: it never
-        triggers a pull.  The next fire observes the new set.
-        """
+        """Update a rank-aware snapshot source after elastic scaling."""
         update = getattr(self._snapshot_source, "update_expected_dp_ranks", None)
         return bool(update is not None and update(expected_dp_ranks))
 
     async def _pull_report(self, timeout_seconds: float) -> pb.LoadReport:
-        """Pull once (retrying one rank-set change), build one report.
-
-        A rank-set mismatch may be transient — a topology update landing
-        while the pull was in flight — so exactly one bounded re-pull with
-        the freshly read expected set is attempted before reporting
-        UNREACHABLE.  CancelledError propagates so shutdown can abort an
-        in-flight pull.
-        """
+        """Pull once (retrying one rank-set change), build one report."""
         report_time_unix_ms = time.time_ns() // 1_000_000
         try:
             for attempt in (1, 2):
@@ -299,8 +283,7 @@ class LoadReporterRuntime:
                 if self._closing:
                     break
 
-                # Broadcast to every session due at completion time.  Reading
-                # the live map also covers sessions registered during the pull.
+                # Broadcast to every session due at completion time (covers sessions registered during the pull).
                 now = time.monotonic()
                 for session in list(self._sessions.values()):
                     if (
@@ -324,11 +307,7 @@ class LoadReporterRuntime:
         await asyncio.shield(self._close_task)
 
     async def _close_impl(self) -> None:
-        """Stop every session, then cancel the fire task directly.
-
-        An in-flight pull is cancelled at once rather than awaited to its
-        timeout, so shutdown stays prompt.
-        """
+        """Stop every session, then cancel the fire task directly."""
         self._closing = True
         self._state_changed.set()
         for session in list(self._sessions.values()):

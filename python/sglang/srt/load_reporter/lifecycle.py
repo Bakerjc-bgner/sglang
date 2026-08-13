@@ -49,15 +49,7 @@ async def start_load_reporter(
     server_args: Any,
     snapshot_source: Any,
 ) -> Optional[LoadReporterHandle]:
-    """Start the reporter and return its handle when enabled.
-
-    Args:
-        server_args: ServerArgs with load_reporter_port and host.
-        snapshot_source: Required when enabled; the LoadSnapshotSource to sample.
-
-    Returns:
-        Handle if the reporter is enabled, None otherwise.
-    """
+    """Start the reporter and return its handle when enabled."""
     if getattr(server_args, "load_reporter_port", None) is None:
         return None
 

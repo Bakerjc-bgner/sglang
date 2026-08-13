@@ -1,13 +1,4 @@
-"""Contract tests for the load reporter composition root.
-
-``start_load_reporter`` is the single serving-mode-agnostic entry point.  These
-tests observe behaviour only through:
-  - the returned handle (or ``None``)
-  - a real ``grpc.aio`` client connecting to the owner-path listener
-
-Request execution has no edge into the sampling graph.  Test coverage focuses
-on lifecycle, periodic reporting, and topology updates through the handle.
-"""
+"""Contract tests for the load reporter composition root."""
 
 from __future__ import annotations
 
@@ -131,11 +122,7 @@ class TestDisabled:
             )
 
     def test_no_grpc_import_when_disabled(self):
-        """Importing lifecycle + calling with port=None must not import grpc.
-
-        Runs in a clean subprocess so already-imported grpc in this session
-        does not mask a regression.
-        """
+        """Calling with port=None must not import grpc (checked in a clean subprocess)."""
         import os
         import subprocess
         import sys
@@ -282,8 +269,7 @@ class TestOwnerPath:
 class TestHttpLifecycleAdapter:
     @pytest.mark.asyncio
     async def test_single_tokenizer_start_returns_handle_and_close_releases_port(self):
-        """HTTP single-tokenizer calls start_load_reporter directly; close()
-        releases the listener port."""
+        """HTTP single-tokenizer calls start_load_reporter directly; close() releases the port."""
         from sglang.srt.load_reporter.lifecycle import start_load_reporter
         from sglang.srt.load_reporter.snapshot_source import ManagerLoadSnapshotSource
 

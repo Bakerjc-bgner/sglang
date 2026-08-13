@@ -1,9 +1,4 @@
-"""Unit tests for the LoadReporterRuntime push-channel fire loop.
-
-Tests exercise runtime.register_session, the single shared fire timer, session
-lease bookkeeping, and shutdown using call-counting fake sources.
-No grpc.aio server is needed; sessions are driven directly.
-"""
+"""Unit tests for the LoadReporterRuntime push-channel fire loop."""
 
 from __future__ import annotations
 
@@ -122,10 +117,7 @@ class MutableSnapshotSource:
 
 
 class ScriptedSnapshotSource:
-    """Return one scripted result (or raise it) per get_loads call.
-
-    The last script step repeats once the script is exhausted.
-    """
+    """Return one scripted result (or raise it) per get_loads call; last step repeats."""
 
     def __init__(self, script: list, dp_size: int = 1) -> None:
         self._script = list(script)
@@ -578,13 +570,7 @@ class TestSameRouterIdReplacement:
 
     @pytest.mark.asyncio
     async def test_replacement_does_not_corrupt_session_table(self):
-        """C1 regression: old session's on_close must not delete the new session.
-
-        Bug mechanism: _on_session_closed was generation-blind — it did
-        self._sessions.pop(router_id) unconditionally, so when the old session's
-        cleanup ran asynchronously it silently removed the new session from the
-        table and leaked it.  The fire loop must keep serving the replacement.
-        """
+        """C1 regression: a generation-blind on_close deleted the replacement session; the fire loop must keep serving it."""
         from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 
         source = FakeSnapshotSource()
