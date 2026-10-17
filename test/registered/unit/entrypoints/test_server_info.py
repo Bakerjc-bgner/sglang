@@ -65,6 +65,28 @@ def _stub_tokenizer_manager(
 
 
 class TestModelInfoSerialization(CustomTestCase):
+    def test_load_reporter_discovery_only_on_instance_leader(self):
+        for node in (0, 1):
+            args = ServerArgs(
+                model_path="dummy", load_reporter_port=30100, node_rank=node
+            )
+            publish(args, role="tokenizer")
+            try:
+                info = common.build_server_info(args, {})
+                if node == 0:
+                    self.assertEqual(
+                        info["load_reporter"],
+                        {
+                            "port": 30100,
+                            "protocol": "grpc",
+                            "service": "sglang.router.loadmonitor.v1.LoadMonitorService",
+                        },
+                    )
+                else:
+                    self.assertIsNone(info["load_reporter"])
+            finally:
+                reset_context()
+
     def test_model_info_serializes_custom_loader_class(self):
         server_args = ServerArgs(model_path="dummy")
         values = {

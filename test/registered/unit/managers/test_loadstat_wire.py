@@ -7,7 +7,7 @@ only the Python side):
     ["LoadStat", num_running_reqs, num_waiting_reqs, num_tokens,
      max_total_num_tokens, attn_dp_rank,
      num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
-     total_prefill_uncached_tokens, total_prefill_busy_us]
+     total_prefill_uncached_tokens, total_prefill_busy_us, reporter_metadata]
 
 carried as the payload of a three-frame message ``[b"load", BE-i64 seq,
 payload]``. A field reorder or rename is a silent cross-language break, so
@@ -17,6 +17,7 @@ TestLoadPublisherGating pins which schedulers publish and on which port.
 CPU-only: the socket bind is stubbed at the `_open_pub_socket` seam.
 """
 
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -47,7 +48,9 @@ class TestLoadStatWire(CustomTestCase):
                 attn_dp_rank=2,
             )
         )
-        self.assertEqual(raw.hex(), "9ba84c6f6164537461740703cd0400cd2000020000000000")
+        self.assertEqual(
+            raw.hex(), "9ca84c6f6164537461740703cd0400cd2000020000000000c0"
+        )
 
     def test_loadstat_msgpack_array_shape(self):
         raw = msgspec.msgpack.Encoder().encode(
@@ -63,7 +66,7 @@ class TestLoadStatWire(CustomTestCase):
         # router reads the tag and four base fields and ignores the suffix.
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(raw),
-            ["LoadStat", 7, 3, 1024, 8192, 2, 0, 0, 0, 0, 0],
+            ["LoadStat", 7, 3, 1024, 8192, 2, 0, 0, 0, 0, 0, None],
         )
 
     def test_loadstat_tag_is_class_name(self):
@@ -81,7 +84,7 @@ class TestLoadStatWire(CustomTestCase):
         # LoadStat sets no omit_defaults, so the trailing field is always
         # emitted (null when unset); a decoder must tolerate it. The new suffix
         # fields are always emitted as well.
-        self.assertEqual(decoded, ["LoadStat", 0, 0, 0, 0, None, 0, 0, 0, 0, 0])
+        self.assertEqual(decoded, ["LoadStat", 0, 0, 0, 0, None, 0, 0, 0, 0, 0, None])
 
 
 ZMQ_ENDPOINT = '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'
@@ -293,7 +296,13 @@ class TestLoadPublisherGating(CustomTestCase):
             "sglang.srt.managers.scheduler_components.load_publisher._open_pub_socket",
             side_effect=zmq.ZMQError,
         ) as open_sock:
-            with published_topology():
+            with (
+                published_topology(load_reporter_port=None),
+                patch.dict(
+                    sys.modules,
+                    {"sglang.srt.load_reporter.publisher": None},
+                ),
+            ):
                 pub = SchedulerLoadPublisher(
                     kv_events_config=ZMQ_ENDPOINT,
                     load_publish_endpoint="auto",
@@ -389,7 +398,7 @@ class TestLoadPublisherGating(CustomTestCase):
         self.assertEqual(seq, (0).to_bytes(8, "big"))
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(payload),
-            ["LoadStat", 1, 2, 3, 4, 0, 5, 6, 7, 8, 9],
+            ["LoadStat", 1, 2, 3, 4, 0, 5, 6, 7, 8, 9, None],
         )
 
     def test_unchanged_stat_is_deduped_to_the_heartbeat(self):
@@ -472,7 +481,13 @@ class TestLoadStatIntegration(CustomTestCase):
             with _socket.socket() as probe:
                 probe.bind(("", 0))
                 port = probe.getsockname()[1]
-            with published_topology():
+            with (
+                published_topology(load_reporter_port=None),
+                patch.dict(
+                    sys.modules,
+                    {"sglang.srt.load_reporter.publisher": None},
+                ),
+            ):
                 pub = SchedulerLoadPublisher(
                     kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
                     load_publish_endpoint=f"tcp://*:{port}",
@@ -514,7 +529,7 @@ class TestLoadStatIntegration(CustomTestCase):
         self.assertEqual(len(seq), 8)
         self.assertEqual(
             msgspec.msgpack.Decoder().decode(payload),
-            ["LoadStat", 7, 3, 1024, 8192, 0, 512, 4096, 64, 20_000, 2_000_000],
+            ["LoadStat", 7, 3, 1024, 8192, 0, 512, 4096, 64, 20_000, 2_000_000, None],
         )
 
 

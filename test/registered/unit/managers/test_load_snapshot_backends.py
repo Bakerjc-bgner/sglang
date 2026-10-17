@@ -1,11 +1,15 @@
 """Unit tests for LoadSnapshot SHM and ZMQ backends."""
 
 import os
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import zmq
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import (
@@ -17,7 +21,9 @@ from sglang.srt.managers.load_snapshot import (
     _zmq_addr_for,
     create_load_snapshot_reader,
     create_load_snapshot_writer,
+    shm_path_for,
     should_use_zmq,
+    snapshot_encoder,
     zmq_reader_owner,
 )
 from sglang.srt.runtime_context import get_context
@@ -174,39 +180,63 @@ class TestZmqRoundTrip(CustomTestCase):
                 os.unlink(shm_path)
 
     def test_multi_rank_zmq(self):
-        shm_path = _temp_path()
-        addr = _ipc_addr()
-        dp_size = 4
-        reader = ZmqShmLoadSnapshotReader(addr, shm_path, dp_size)
-        writers = []
-        try:
-            for rank in range(dp_size):
-                w = ZmqLoadSnapshotWriter(addr, dp_size, dp_rank=rank)
-                writers.append(w)
+        # Each rank has its own connection; conflation must retain every rank's
+        # latest snapshot even when the owner drains after a burst of updates.
+        for transport in ("ipc", "tcp"):
+            for reporter_port in (None, 30100):
+                with (
+                    self.subTest(transport=transport, reporter_port=reporter_port),
+                    tempfile.TemporaryDirectory() as directory,
+                    get_context().override_server_args(
+                        load_reporter_port=reporter_port
+                    ),
+                ):
+                    shm_path = f"{directory}/loads"
+                    addr = (
+                        f"ipc://{directory}/socket"
+                        if transport == "ipc"
+                        else "tcp://127.0.0.1:*"
+                    )
+                    dp_size = 4
+                    reader = ZmqShmLoadSnapshotReader(addr, shm_path, dp_size)
+                    addr = reader._socket.getsockopt_string(zmq.LAST_ENDPOINT)
+                    writers = []
+                    try:
+                        for rank in range(dp_size):
+                            writer = zmq.Context.instance().socket(zmq.PUSH)
+                            writers.append(writer)
+                            writer.setsockopt(zmq.LINGER, 0)
+                            writer.setsockopt(zmq.SNDTIMEO, 1000)
+                            writer.connect(addr)
 
-            _warmup_zmq(writers, reader)
+                        for rank, writer in enumerate(writers):
+                            # Isolate receiver conflation from sender conflation
+                            # and the production writer's best-effort sends.
+                            for sequence in range(1, 33):
+                                writer.send(
+                                    snapshot_encoder.encode(
+                                        LoadSnapshot(
+                                            dp_rank=rank,
+                                            num_running_reqs=rank + 1,
+                                            timestamp=float(sequence),
+                                        )
+                                    )
+                                )
 
-            for rank, w in enumerate(writers):
-                w.write(
-                    LoadSnapshot(dp_rank=rank, num_running_reqs=rank + 1, timestamp=3.0)
-                )
-
-            loads = _read_until(
-                lambda: reader.read_all(),
-                lambda snaps: (
-                    len(snaps) == dp_size
-                    and all(snap.timestamp == 3.0 for snap in snaps)
-                ),
-            )
-            self.assertEqual(len(loads), dp_size)
-            for load in loads:
-                self.assertEqual(load.num_running_reqs, load.dp_rank + 1)
-        finally:
-            for w in writers:
-                w.close()
-            reader.close()
-            if os.path.exists(shm_path):
-                os.unlink(shm_path)
+                        loads = _read_until(
+                            reader.read_all,
+                            lambda snaps: (
+                                len(snaps) == dp_size
+                                and all(snap.timestamp == 32 for snap in snaps)
+                            ),
+                        )
+                        self.assertEqual(len(loads), dp_size)
+                        for load in loads:
+                            self.assertEqual(load.num_running_reqs, load.dp_rank + 1)
+                    finally:
+                        for writer in writers:
+                            writer.close()
+                        reader.close()
 
     def test_read_returns_latest(self):
         shm_path = _temp_path()
@@ -246,15 +276,23 @@ class TestZmqRoundTrip(CustomTestCase):
                 os.unlink(ipc_path)
 
     def test_reader_ipc_cleanup(self):
-        addr = _ipc_addr()
-        shm_path = _temp_path()
-        ipc_path = addr[len("ipc://") :]
-        reader = ZmqShmLoadSnapshotReader(addr, shm_path, dp_size=1)
-        self.assertTrue(os.path.exists(ipc_path))
-        reader.close()
-        self.assertFalse(os.path.exists(ipc_path))
-        if os.path.exists(shm_path):
-            os.unlink(shm_path)
+        for reporter_port in (None, 30100):
+            with (
+                self.subTest(reporter_port=reporter_port),
+                get_context().override_server_args(load_reporter_port=reporter_port),
+            ):
+                addr = _ipc_addr()
+                shm_path = _temp_path()
+                ipc_path = addr[len("ipc://") :]
+                reader = ZmqShmLoadSnapshotReader(addr, shm_path, 1)
+                try:
+                    self.assertTrue(os.path.exists(ipc_path))
+                    self.assertIsNone(reader.poll())
+                finally:
+                    reader.close()
+                self.assertFalse(os.path.exists(ipc_path))
+                if os.path.exists(shm_path):
+                    os.unlink(shm_path)
 
 
 class TestFactoryFunctions(CustomTestCase):
@@ -262,6 +300,61 @@ class TestFactoryFunctions(CustomTestCase):
         override = get_context().override_server_args(**fields)
         override.install()
         self.addCleanup(override.restore)
+
+    def test_native_readers_do_not_depend_on_reporter_modules(
+        self,
+    ):
+        self._publish(nnodes=1, dp_size=1, load_reporter_port=30100)
+        for use_zmq in (False, True):
+            with (
+                self.subTest(zmq=use_zmq),
+                tempfile.TemporaryDirectory() as directory,
+                envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(use_zmq),
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.load_reporter.pub_source": None,
+                        "sglang.srt.load_reporter.snapshot_source": None,
+                        "sglang.srt.load_reporter.lifecycle": None,
+                    },
+                ),
+            ):
+                ports = SimpleNamespace(
+                    instance_id=os.path.basename(directory),
+                    load_collector_ipc_name=f"ipc://{directory}/owner",
+                )
+                path = shm_path_for(ports.instance_id)
+                threads = set(threading.enumerate())
+                reader = create_load_snapshot_reader(ports, "TokenizerManager")
+                writer = create_load_snapshot_writer(ports, 1, 0)
+                try:
+                    expected_type = (
+                        ZmqShmLoadSnapshotReader if use_zmq else ShmLoadSnapshotReader
+                    )
+                    self.assertIs(type(reader), expected_type)
+                    if use_zmq:
+                        self.assertEqual(
+                            reader._socket.getsockopt(reader._zmq.CONFLATE), 1
+                        )
+                    # Legacy readers expose even a zero source timestamp; the
+                    # reporter's freshness filter must not leak into this path.
+                    writer.write(LoadSnapshot(timestamp=0, num_running_reqs=7))
+                    loads = _read_until(
+                        reader.read_all,
+                        lambda loads: loads and loads[0].num_running_reqs == 7,
+                    )
+                    self.assertEqual(loads[0].timestamp, 0)
+                    shared = ShmLoadSnapshotReader(path, 1)
+                    try:
+                        self.assertEqual(shared.read_all(), loads)
+                    finally:
+                        shared.close()
+                    self.assertEqual(set(threading.enumerate()), threads)
+                finally:
+                    writer.close()
+                    reader.close()
+                    if os.path.exists(path):
+                        os.unlink(path)
 
     def test_shm_mode(self):
         self._publish(nnodes=1, dp_size=1)
