@@ -97,6 +97,7 @@ from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
+from sglang.srt.load_reporter import describe_load_reporter
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -3648,6 +3649,7 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
     result["kv_events"] = describe_kv_events_publisher(server_args)
+    result["load_reporter"] = describe_load_reporter(server_args)
     return result
 
 

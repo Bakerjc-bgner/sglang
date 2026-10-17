@@ -121,6 +121,11 @@ from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.load_reporter import (
+    close_load_reporter,
+    init_load_reporter,
+    start_load_reporter,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -286,6 +291,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
+    load_reporter = None
     sidecar = None
     warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
@@ -416,6 +422,8 @@ async def lifespan(fast_api_app: FastAPI):
     # --grpc-port / SGLANG_GRPC_PORT; only the single-tokenizer process is
     # gRPC-capable (__post_init__ rejects --tokenizer-worker-num > 1).
     try:
+        load_reporter = init_load_reporter()
+        start_load_reporter(load_reporter)
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and get_serving().grpc_port is not None
@@ -443,6 +451,7 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        close_load_reporter(load_reporter)
         if sidecar is not None:
             try:
                 sidecar.stop()
@@ -2695,6 +2704,7 @@ def _setup_and_run_http_server(
             },
         )
 
+    load_reporter = None
     try:
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
@@ -2799,6 +2809,9 @@ def _setup_and_run_http_server(
             # Child processes re-import the app, so no stop hook here.
             from uvicorn.config import LOGGING_CONFIG
 
+            load_reporter = init_load_reporter(http_parent=True)
+            start_load_reporter(load_reporter)
+
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
                 "handlers": ["default"],
                 "level": "INFO",
@@ -2852,6 +2865,7 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=get_serving().ssl_keyfile_password,
                 )
     finally:
+        close_load_reporter(load_reporter)
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
                 multi_tokenizer_args_shm.unlink()

@@ -42,6 +42,8 @@ from sglang.srt.disaggregation.kv_events import (
     resolve_load_pub_range,
     select_kv_publisher_dp_rank,
 )
+from sglang.srt.load_reporter import is_load_reporter_enabled
+from sglang.srt.load_reporter.publisher_protocol import PublisherMetadata
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress, is_zmq_endpoint_ipv6
 
@@ -81,10 +83,12 @@ class LoadStat(
     Wire shape (tag + array_like): ``["LoadStat", num_running_reqs,
     num_waiting_reqs, num_tokens, max_total_num_tokens, attn_dp_rank,
     num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
-    total_prefill_uncached_tokens, total_prefill_busy_us]``.
+    total_prefill_uncached_tokens, total_prefill_busy_us, reporter_metadata]``.
 
     The first six positions are the #34608-compatible prefix. Current routers
     ignore appended fields, so extending the payload preserves compatibility.
+    Instance reporting enables the optional reporter_metadata suffix;
+    native port-range publishing leaves it null.
     """
 
     num_running_reqs: int
@@ -99,6 +103,8 @@ class LoadStat(
     max_running_requests: int = 0  # Scheduler running-request limit
     total_prefill_uncached_tokens: int = 0  # Cumulative uncached prefill tokens
     total_prefill_busy_us: int = 0  # Cumulative prefill step time in microseconds
+    # Optional suffix: old LoadStat decoders ignore it. Native mode omits metadata.
+    reporter_metadata: Optional[PublisherMetadata] = None
 
 
 def _open_pub_socket(endpoint: str) -> zmq.Socket:
@@ -146,6 +152,16 @@ class SchedulerLoadPublisher:
         self._last_counts: Optional[tuple] = None
         self._last_publish_ts = 0.0
         self._publish_failed = False
+        self._reporter_publisher = None
+        if is_load_reporter_enabled():
+            from sglang.srt.load_reporter.publisher import ConnectingPublisher
+
+            self._reporter_publisher = ConnectingPublisher(hwm=LOAD_PUB_HWM)
+            self._socket = self._reporter_publisher.socket
+            self._rank = self._reporter_publisher.rank
+            if self._socket is not None:
+                atexit.register(self.close)
+            return
         if not is_kv_publisher_rank(kv_events_config):
             return
         try:
@@ -194,7 +210,7 @@ class SchedulerLoadPublisher:
 
     @property
     def enable(self) -> bool:
-        """True when a real load PUB socket is bound."""
+        """True when a real load PUB socket is configured."""
         return self._socket is not None
 
     def publish_load_stat(
@@ -241,6 +257,8 @@ class SchedulerLoadPublisher:
                 load.total_prefill_uncached_tokens,
                 load.total_prefill_busy_us,
             )
+            if self._reporter_publisher is not None:
+                counts += self._reporter_publisher.extra_counts(load)
             if (
                 counts == self._last_counts
                 and now - self._last_publish_ts < LOAD_PUBLISH_HEARTBEAT_S
@@ -258,6 +276,11 @@ class SchedulerLoadPublisher:
                     max_running_requests=counts[6],
                     total_prefill_uncached_tokens=counts[7],
                     total_prefill_busy_us=counts[8],
+                    reporter_metadata=(
+                        self._reporter_publisher.metadata(load)
+                        if self._reporter_publisher is not None
+                        else None
+                    ),
                 )
             )
             seq = next(self._seq).to_bytes(8, "big")

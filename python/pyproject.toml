@@ -107,6 +107,7 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
+load-reporter = ["grpcio>=1.78.0", "protobuf>=6.31.1"]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 instanttensor = ["instanttensor>=0.1.9"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
@@ -199,6 +200,7 @@ all = [
   "sglang[diffusion]",
   "sglang[fastokens]",
   "sglang[http2]",
+  "sglang[load-reporter]",
   "sglang[tracing]",
 ]
 

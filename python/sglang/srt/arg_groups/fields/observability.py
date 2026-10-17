@@ -87,6 +87,11 @@ class Observability(msgspec.Struct):
         int,
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
     ] = 15
+    load_reporter_port: A[
+        Optional[int],
+        "Enable the instance PUB/SUB load reporter on this gRPC port and reserve the next port for its node-0 SUB listener. "
+        "Scheduler PUBs connect to the --dist-init-addr host (127.0.0.1 on a single node without it). Disabled when unset.",
+    ] = None
     tokenizer_metrics_custom_labels_header: A[
         str, "Specify the HTTP header for passing custom labels for tokenizer metrics."
     ] = "x-custom-labels"
