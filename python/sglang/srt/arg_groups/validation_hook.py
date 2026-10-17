@@ -19,6 +19,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.load_reporter.validation import check_load_reporter_args
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
@@ -430,12 +431,6 @@ def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
         assert all(val >= 0 for val in bucket_values), (
             f"{arg_name} custom rule bucket values should be non-negative"
         )
-
-
-def check_load_reporter_args(server_args: Any):
-    from sglang.srt.load_reporter.validation import check_load_reporter_args as validate
-
-    validate(server_args)
 
 
 def check_load_publish_args(server_args: Any):
